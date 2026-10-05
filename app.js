@@ -3,7 +3,7 @@
 (function () {
   'use strict';
   const C = window.AuraCore;
-  const APP_BUILD = '11';
+  const APP_BUILD = '13';
   // A missing element (page and script from different versions) must never crash the whole app
   const $ = (id) => document.getElementById(id) || document.createElement('div');
   const store = {
@@ -179,13 +179,32 @@
     if (S.calendar && S.gcid) {
       const ok = await refreshCalendar();
       if (ok === 'renewing') { sessionStorage.setItem('aura.pending', JSON.stringify({ text, at: Date.now() })); return; }   // back after Google, then we ask
-      if (ok === false && calNotice && Date.now() - lastCalNotice > 10 * 60e3) {            // tell her person why the calendar isn't working
+      if (ok === false && calNotice && !C.scheduleIntent(text) && !C.calendarIntent(text) && Date.now() - lastCalNotice > 10 * 60e3) {   // (schedule/add requests explain it themselves)            // tell her person why the calendar isn't working
         lastCalNotice = Date.now(); say(`<span class="err">${esc(calNotice)}</span>`, 14); await sleep(3500);
       }
     } else calCtx = null;
     busy = true; $('btn-mic').disabled = true;
     history.push({ role: 'user', text }); store.set('history', history);
     dots(); if (!speaking) { clearTimeout(gestureTimer); show('think'); }
+    actionsHtml = ''; pendingActions = [];
+    if (S.calendar && S.gcid && S.calAdd && calToken() && C.calendarIntent(text)) {      // "add lunch tomorrow 11 to 1:30": do it ourselves
+      const r = await extractEvent(text);
+      if (r && !r.down) {                                    // (if every brain is down, carry on so she can say so)
+        let visible = null, acts = [];
+        if (r.ev) {
+          acts = [r.ev];
+          const st = new Date(r.ev.start), when = st.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+          visible = `Done, I prepared “${r.ev.title}” for ${when}${r.ev.location ? ' at ' + r.ev.location : ''}. Tap Add to calendar to save it.`;
+        } else if (/calendar|agenda|kalender|jadwal|schedule|event/i.test(text)) {
+          visible = r.missing ? 'Sure! Which day and what time should I put it at?' : 'I couldn\'t work out the day and time from that. Try something like: “Add lunch at Citywalk tomorrow 11:00 to 13:30 to my calendar”.';
+        }
+        if (visible !== null) { await cannedReply({ visible, acts, gestureName: r.ev ? 'nod' : 'think' }); return; }
+      }
+    }
+    if (S.calendar && S.gcid && C.scheduleIntent(text)) {                          // "what's on tomorrow?": read the calendar ourselves
+      if (await answerSchedule(text)) return;
+    }
+
     let raw = '', sources = [], gestured = false;
     actionsHtml = ''; pendingActions = [];
     typed = ''; target = ''; done = false;
@@ -433,6 +452,76 @@
     pool().push({ id: `${kind}-${Date.now().toString(36)}`, kind, key: '', enabled: true });
     addSel.value = ''; saveSettings(); renderBrains();
   });
+
+  /** An answer the app wrote itself (no AI): show it like a normal reply, with optional buttons and a short spoken version. */
+  async function cannedReply({ visible, acts = [], gestureName = 'nod', speakText = '' }) {
+    pendingActions = acts; actionsHtml = acts.map(actionCard).join('');
+    history.push({ role: 'model', text: visible + acts.map((a) => `\n[Calendar event prepared: ${a.title}, ${a.start}–${a.end}]`).join(''), via: 'Mira' });
+    history = history.slice(-80); store.set('history', history);
+    typed = ''; target = ''; done = false; gesture(gestureName); stream(visible, true);
+    busy = false; $('btn-mic').disabled = false;
+    const spoke = S.speak && speakText ? await speak(speakText) : false;
+    hideIn(acts.length ? 45 : spoke ? 4 : Math.min(30, 5 + C.plain(visible).slice(0, 150).split(/\s+/).length * 0.3));
+  }
+  /** Schedule questions: ask Google for exactly the days mentioned and write the answer here. Returns true when handled. */
+  async function answerSchedule(text) {
+    const range = C.parseRange(text), lang = C.guessLang(text);
+    let r;
+    try {
+      r = await calFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?' + new URLSearchParams({
+        timeMin: range.start.toISOString(), timeMax: range.end.toISOString(), singleEvents: 'true', orderBy: 'startTime', maxResults: '100' }));
+    } catch { r = null; }
+    if (r && r.status === 401) { store.set('calToken', null); sessionStorage.setItem('aura.pending', JSON.stringify({ text, at: Date.now() })); history.pop(); store.set('history', history); busy = false; $('btn-mic').disabled = false; calConnect(true); return true; }
+    if (!r || !r.ok) {
+      const why = r ? calErrorText(r.status, await r.text().catch(() => '')) : calErrorText(0, '');
+      await cannedReply({ visible: `I couldn't read your calendar. ${why}`, gestureName: 'sad' }); return true;
+    }
+    const out = C.formatSchedule((await r.json()).items || [], range, { lang, free: C.isFreeQuestion(text) });
+    await cannedReply({ visible: out.text, gestureName: 'nod', speakText: out.speak });
+    return true;
+  }
+
+  // ───────── adding calendar events without relying on the AI to follow instructions ─────────
+  async function oneShot(entry, system, user) {
+    if (entry.type === 'gemini') {
+      let r;
+      try { r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(entry.model)}:generateContent`, { method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': entry.key },
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0, maxOutputTokens: 800 } }) }); }
+      catch { throw { status: 0 }; }
+      if (!r.ok) throw { status: r.status, body: await r.text().catch(() => '') };
+      const j = await r.json(); return ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
+    }
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${entry.key}` };
+    if (/openrouter\.ai/.test(entry.base)) headers['X-Title'] = 'Aura';
+    let r;
+    try { r = await fetch(`${entry.base}/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: entry.model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0, max_tokens: 400 }) }); }
+    catch { throw { status: 0 }; }
+    if (!r.ok) throw { status: r.status, body: await r.text().catch(() => '') };
+    const j = await r.json(); return C.stripThink((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '');
+  }
+  /** Ask any available brain to turn the sentence into event fields. Returns { ev } | { missing } | null. */
+  async function extractEvent(text) {
+    const d = new Date(), off = -d.getTimezoneOffset(), z = `UTC${off >= 0 ? '+' : '-'}${Math.floor(Math.abs(off) / 60)}`;
+    const nowTxt = `${d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}, ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} (${z})`;
+    const system = `Turn the user's message into one calendar event. Now it is ${nowTxt}; resolve "today", "tomorrow", weekdays and similar from that date. ` +
+      'Answer with ONLY a JSON object, nothing else: {"title":"short title","start":"YYYY-MM-DDTHH:MM","end":"YYYY-MM-DDTHH:MM","location":"place or empty"} in local time, 24-hour. ' +
+      'If no end time is given use start plus 1 hour. If the day or the time is missing, answer {"error":"missing"}.';
+    let tried = 0, got = false;
+    for (const entry of C.available(pool(), S, health)) {
+      if (tried >= 2) break;
+      try {
+        const out = await oneShot(entry, system, text); tried++; got = true;
+        setHealth(C.markOk(health, entry.id));
+        const r = C.parseEventJson(out); if (r) return r;
+      } catch (err) {
+        if (err.status === undefined) { tried++; continue; }              // an odd reply, not a failing brain: don't punish it
+        const cls = C.classifyFailure({ status: err.status, body: err.body, type: entry.type, fails: (health[entry.id] || {}).fails || 0 });
+        setHealth(C.markFail(health, entry.id, cls)); updateVia();
+      }
+    }
+    return got ? { unusable: true } : { down: true };      // an answer we couldn't use, or no brain answered at all
+  }
 
   // ───────── WhatsApp drafts and calendar events ─────────
   let pendingActions = [];

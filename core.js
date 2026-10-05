@@ -345,8 +345,149 @@
     return t.length ? Math.min(...t) : 0;
   }
 
-  const BUILD = '11';
-  const api = { BUILD, CATALOG, LITE, defaultPool, describe, available, quotaResetAt, classifyFailure, markFail, markOk, backText, statusOf, restingSummary, soonestReturn,
+  const BUILD = '13';
+  // ───────── schedule questions answered straight from the calendar (no AI involved) ─────────
+  const guessLang = (t) => (/\b(besok|lusa|hari ini|jadwal|kalender|agenda|saya|aku|gue|apa|ada|minggu|pekan|senin|selasa|rabu|kamis|jumat|sabtu|rapat|acara|kosong|sibuk|bisa)\b/i.test(t) ? 'id' : 'en');
+  /** "what's on my calendar tomorrow", "am I free Friday afternoon", "apa jadwal saya besok"… (not adding events) */
+  function scheduleIntent(text) {
+    const t = String(text || '').toLowerCase();
+    if (calendarIntent(t)) return false;
+    const thing = '(?:calendar|agenda|(?:my|our|the|your)\\s+schedule|meetings?|appointments?|events?|plans|kalender|jadwal|acara|rapat|janji)';
+    const ask = "(?:what(?:['’]s|\\s+is|\\s+are)?|show|list|check|tell me|read|any|apa|ada|cek|lihat|tunjukkan|kasih tahu|bacakan)";
+    const strong = '(?:calendar|agenda|kalender|jadwal|acara|rapat|janji|(?:my|our|your|the)\\s+schedule|(?:my|our|your)\\s+(?:meetings?|appointments?|events?|plans))';
+    return new RegExp(`\\b${ask}\\b[\\s\\S]{0,40}\\b${strong}\\b`).test(t)
+      || /\bany\s+(?:meetings?|appointments?|events?|plans)\b(?![\s\S]{0,15}\b(?:of|for|by|from|at)\b)[\s\S]{0,25}\b(?:today|tomorrow|tonight|this week|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(t)
+      || /\bwhat\s+(?:do i have|have i got|am i doing)\b/.test(t)
+      || /\bwhat(?:['’]s|\s+is)\s+(?:coming up|on)\b[\s\S]{0,25}\b(?:today|tomorrow|tonight|this week|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d)/.test(t)
+      || /\b(?:besok|hari ini|lusa|minggu ini|minggu depan|pekan ini|pekan depan)\s+ada\s+apa\b/.test(t)
+      || /\b(?:am i|are we)\s+(?:free|busy|available)\b/.test(t)
+      || new RegExp(`\\bdo i have\\b[\\s\\S]{0,40}\\b(?:anything|something|${thing}|free time)\\b`).test(t)
+      || new RegExp(`\\b(?:is there|have i got)\\b[\\s\\S]{0,30}\\b(?:anything|${thing})\\b`).test(t)
+      || new RegExp(`\\b(?:calendar|agenda|(?:my|the|our)\\s+schedule|kalender|jadwal)\\b[\\s\\S]{0,25}\\b(?:today|tomorrow|tonight|this week|next week|hari ini|besok|lusa|minggu ini|minggu depan|pekan ini|pekan depan|monday|tuesday|wednesday|thursday|friday|saturday|sunday|senin|selasa|rabu|kamis|jumat|sabtu)\\b`).test(t)
+      || /\b(?:besok|hari ini|lusa)\s+(?:ada|saya ada|aku ada)\s+(?:apa|acara|rapat|jadwal)\b/.test(t)
+      || /\b(?:saya|aku|gue)\s+(?:ada|punya)\s+(?:acara|rapat|meeting|agenda|jadwal|janji)\b/.test(t)
+      || /\b(?:kosong|sibuk)\s+(?:nggak|gak|tidak|ngga)?\b/.test(t) && /\b(?:besok|hari ini|lusa|minggu|senin|selasa|rabu|kamis|jumat|sabtu)\b/.test(t);
+  }
+  const isFreeQuestion = (t) => /\b(am i|are we)\s+(free|busy|available)\b|\bfree time\b|\b(kosong|sibuk|luang)\b|\bavailable\b/i.test(String(t || ''));
+  const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, mei: 4, jun: 5, jul: 6, aug: 7, agu: 7, sep: 8, oct: 9, okt: 9, nov: 10, dec: 11, des: 11 };
+  const WEEKDAYS = [['sunday|sun|hari minggu', 0], ['monday|mon|senin', 1], ['tuesday|tues|tue|selasa', 2], ['wednesday|wed|rabu', 3], ['thursday|thurs|thur|thu|kamis', 4], ['friday|fri|jumat|jum\'at', 5], ['saturday|sat|sabtu', 6]];
+  const sod = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+  const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+  /** Which days is the person asking about? -> { start, end (exclusive), key, part, date } */
+  function parseRange(text, now = new Date()) {
+    const t = String(text || '').toLowerCase(); const today = sod(now);
+    let part = null;
+    if (/\b(morning|pagi)\b/.test(t)) part = 'morning'; else if (/\b(afternoon|siang|sore)\b/.test(t)) part = 'afternoon'; else if (/\b(evening|tonight|night|malam)\b/.test(t)) part = 'evening';
+    const mk = (start, days, key, extra = {}) => ({ start, end: addDays(start, days), key, part, ...extra });
+    const monday = addDays(today, (8 - today.getDay()) % 7 || 7);
+    if (/\b(day after tomorrow|lusa)\b/.test(t)) return mk(addDays(today, 2), 1, 'lusa');
+    if (/\b(tomorrow|besok)\b/.test(t)) return mk(addDays(today, 1), 1, 'tomorrow');
+    if (/\b(next week|minggu depan|pekan depan)\b/.test(t)) return mk(monday, 7, 'nextweek');
+    if (/\b(this week|minggu ini|pekan ini|week)\b/.test(t)) return { start: today, end: monday, key: 'week', part };
+    if (/\b(today|hari ini|tonight|malam ini|sekarang|now)\b/.test(t)) return mk(today, 1, 'today');
+    for (const [names, n] of WEEKDAYS) {
+      if (new RegExp(`\\b(?:${names})\\b`).test(t)) { const diff = (n - today.getDay() + 7) % 7; return mk(addDays(today, diff), 1, 'weekday', { date: addDays(today, diff) }); }
+    }
+    const mon = Object.keys(MONTHS).join('|');
+    const m1 = t.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s*(${mon})[a-z]*\\b`)) || null;
+    const m2 = t.match(new RegExp(`\\b(${mon})[a-z]*\\.?\\s*(\\d{1,2})\\b`)) || null;
+    if (m1 || m2) {
+      const day = Number(m1 ? m1[1] : m2[2]), month = MONTHS[(m1 ? m1[2] : m2[1])];
+      let d = new Date(today.getFullYear(), month, day); if (d < today) d = new Date(today.getFullYear() + 1, month, day);
+      return mk(d, 1, 'date', { date: d });
+    }
+    return { start: today, end: addDays(today, 7), key: 'next7', part };
+  }
+  const PART_HOURS = { morning: [6, 12], afternoon: [12, 18], evening: [18, 23], null: [8, 20] };
+  const LBL = {
+    en: { today: 'today', tomorrow: 'tomorrow', lusa: 'the day after tomorrow', week: 'this week', nextweek: 'next week', next7: 'in the next 7 days', parts: { morning: 'morning', afternoon: 'afternoon', evening: 'evening' } },
+    id: { today: 'hari ini', tomorrow: 'besok', lusa: 'lusa', week: 'minggu ini', nextweek: 'minggu depan', next7: 'dalam 7 hari ke depan', parts: { morning: 'pagi', afternoon: 'siang-sore', evening: 'malam' } },
+  };
+  const LOC = { en: 'en-GB', id: 'id-ID' };
+  const hhmm = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  function rangeLabel(range, lang) {
+    const L = LBL[lang]; let base;
+    if (range.key === 'weekday' || range.key === 'date') {
+      const d = range.date.toLocaleDateString(LOC[lang], { weekday: range.key === 'weekday' ? 'long' : undefined, day: 'numeric', month: 'short' });
+      base = lang === 'id' ? `pada ${d}` : `on ${d}`;
+    } else base = L[range.key];
+    return range.part && range.end - range.start <= 864e5 + 3600e3 ? `${base} ${L.parts[range.part]}` : base;
+  }
+  /** Calendar API items -> { title, allDay, start, end, location } */
+  function normalizeEvents(items) {
+    return (items || []).filter((e) => e.status !== 'cancelled').map((e) => {
+      const allDay = !!(e.start && e.start.date);
+      const start = allDay ? new Date(e.start.date + 'T00:00') : new Date(e.start.dateTime);
+      const end = allDay ? new Date((e.end && e.end.date ? e.end.date : e.start.date) + 'T00:00') : new Date(e.end && e.end.dateTime ? e.end.dateTime : e.start.dateTime);
+      return { title: e.summary || (lang0 === 'id' ? 'Sibuk' : 'Busy'), allDay, start, end, location: e.location || '' };
+    }).filter((e) => !isNaN(e.start)).sort((a, b) => a.start - b.start);
+  }
+  let lang0 = 'en';
+  /** Free stretches of at least `min` minutes inside [ws, we) given busy events. */
+  function freeGaps(events, ws, we, min = 30) {
+    const busy = events.filter((e) => !e.allDay && e.end > ws && e.start < we).map((e) => [Math.max(e.start, ws), Math.min(e.end, we)]).sort((a, b) => a[0] - b[0]);
+    const gaps = []; let cur = ws.getTime();
+    for (const [a, b] of busy) { if (a - cur >= min * 60e3) gaps.push([new Date(cur), new Date(a)]); cur = Math.max(cur, b); }
+    if (we - cur >= min * 60e3) gaps.push([new Date(cur), new Date(we)]);
+    return gaps;
+  }
+  /** The answer text (and a short version to speak) for a schedule question. */
+  function formatSchedule(items, range, { lang = 'en', free = false } = {}) {
+    lang0 = lang; const evs = normalizeEvents(items); const label = rangeLabel(range, lang); const cap = (x) => x.charAt(0).toUpperCase() + x.slice(1);
+    const [h0, h1] = PART_HOURS[range.part];
+    const days = []; for (let d = new Date(range.start); d < range.end && days.length < 14; d = addDays(d, 1)) days.push(new Date(d));
+    const inDay = (d) => evs.filter((e) => e.end > d && e.start < addDays(d, 1) && (e.allDay || e.end > d) && (!range.part || e.allDay || (e.end > new Date(d.getFullYear(), d.getMonth(), d.getDate(), h0) && e.start < new Date(d.getFullYear(), d.getMonth(), d.getDate(), h1))));
+    const line = (e) => `• ${e.allDay ? (lang === 'id' ? '(seharian)' : '(all day)') : `${hhmm(e.start)}–${hhmm(e.end)}`} ${e.title}${e.location ? ` (${e.location})` : ''}`;
+    if (free) {
+      const out = []; const shown = days.slice(0, 3);
+      for (const d of shown) {
+        const ws = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h0), we = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h1);
+        const gaps = freeGaps(evs, d.getTime() === sod(new Date()).getTime() && new Date() > ws ? (new Date() < we ? new Date() : we) : ws, we);
+        const dn = shown.length > 1 ? `${d.toLocaleDateString(LOC[lang], { weekday: 'short', day: 'numeric', month: 'short' })}: ` : '';
+        const whole = gaps.length === 1 && gaps[0][0] <= ws && gaps[0][1] >= we;
+        out.push(`${dn}${!gaps.length ? (lang === 'id' ? 'tidak ada waktu kosong' : 'no free time') : whole ? (lang === 'id' ? 'kosong sepanjang waktu itu' : 'free the whole time') : (lang === 'id' ? 'kosong ' : 'free ') + gaps.map(([a, b]) => `${hhmm(a)}–${hhmm(b)}`).join(', ')}`);
+      }
+      const head = lang === 'id' ? `Soal waktu luang ${label}:` : `About your free time ${label}:`;
+      const body = out.map((x) => `• ${x}`).join('\n');
+      const sched = evs.filter((e) => days.some((d) => inDay(d).includes(e))).slice(0, 12);
+      return { text: `${head}\n${body}${sched.length ? `\n\n${lang === 'id' ? 'Yang sudah ada:' : 'Already booked:'}\n${sched.map(line).join('\n')}` : ''}`, speak: `${head} ${out[0]}` };
+    }
+    const groups = days.map((d) => ({ d, list: inDay(d) })).filter((g) => g.list.length);
+    const all = groups.reduce((n, g) => n + g.list.length, 0);
+    if (!all) { const t = lang === 'id' ? `Tidak ada acara di kalendermu ${label}. Kosong!` : `You have nothing on your calendar ${label}. All clear!`; return { text: t, speak: t }; }
+    const first = groups[0].list.find((e) => !e.allDay) || groups[0].list[0];
+    const sentence = lang === 'id'
+      ? `${cap(label)} kamu punya ${all} acara, pertama ${first.title}${first.allDay ? ' (seharian)' : ' jam ' + hhmm(first.start)}.`
+      : `${cap(label)} you have ${all} thing${all > 1 ? 's' : ''}, starting with ${first.title}${first.allDay ? ' (all day)' : ' at ' + hhmm(first.start)}.`;
+    const body = groups.length === 1 && days.length === 1 ? groups[0].list.slice(0, 25).map(line).join('\n')
+      : groups.slice(0, 10).map((g) => `${g.d.toLocaleDateString(LOC[lang], { weekday: 'short', day: 'numeric', month: 'short' })}\n${g.list.slice(0, 8).map(line).join('\n')}`).join('\n\n');
+    return { text: `${sentence}\n\n${body}`, speak: sentence };
+  }
+
+  /** Does this message ask to put something in the calendar? (English and Indonesian) */
+  function calendarIntent(text) {
+    const t = String(text || '');
+    const add = '(?:add|put|schedule|book|create|save|enter|log|block|set up|insert|tambah(?:kan)?|masukkan|masukin|catat|jadwalkan|buat(?:kan)?|simpan)';
+    const cal = '(?:calendar|agenda|schedule|event|appointment|meeting|call|lunch|dinner|interview|reminder|kalender|jadwal|acara|rapat)';
+    return new RegExp(`\\b${add}\\b[\\s\\S]{0,80}\\b${cal}\\b|\\b${cal}\\b[\\s\\S]{0,40}\\b${add}\\b`, 'i').test(t) && !/\b(what|which|apa|show|list|check|cek|lihat)\b[\s\S]{0,30}\b(on|in|di|ada)\b/i.test(t.slice(0, 40));
+  }
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const fmtLocal = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  /** Read the model's JSON answer for "extract the event". Returns { ev } | { missing: true } | null (unusable). */
+  function parseEventJson(out) {
+    const m = String(out || '').replace(/```(?:json)?/gi, '').match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    let j; try { j = JSON.parse(m[0]); } catch { return null; }
+    if (j.error) return { missing: true };
+    const ok = (s) => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(String(s || ''));
+    if (!j.title || !ok(j.start)) return j.title || j.start ? { missing: true } : null;
+    const st = new Date(String(j.start).slice(0, 16));
+    if (isNaN(st)) return null;
+    let en = ok(j.end) ? new Date(String(j.end).slice(0, 16)) : null;
+    if (!en || isNaN(en) || en <= st) en = new Date(st.getTime() + 3600e3);
+    return { ev: { type: 'calendar', title: String(j.title).trim().slice(0, 120), start: fmtLocal(st), end: fmtLocal(en), location: String(j.location || '').trim().slice(0, 120) } };
+  }
+  const api = { BUILD, guessLang, scheduleIntent, isFreeQuestion, parseRange, rangeLabel, normalizeEvents, freeGaps, formatSchedule, calendarIntent, parseEventJson, CATALOG, LITE, defaultPool, describe, available, quotaResetAt, classifyFailure, markFail, markOk, backText, statusOf, restingSummary, soonestReturn,
     stripThink, openaiPayload, parseContacts, whatsappLink, localToRfc, formatEvents, quotaInfo, quotaResetText, GIF_MS, GESTURES, SOUND_LINES, STYLES, VOICES, MODELS, DEFAULT_PERSONA, buildSystemPrompt, parseSSE, eventPayload, splitTags, plain, splitForTts, friendlyError };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.AuraCore = api;
 })(typeof window !== 'undefined' ? window : globalThis);
