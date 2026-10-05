@@ -10,7 +10,8 @@
   };
 
   // ───────── settings ─────────
-  const DEFAULTS = { name: '', geminiKey: '', groqKey: '', model: C.MODELS[0], speak: true, voice: 'hannah', style: 'soft-cheerful', sounds: true, persona: C.DEFAULT_PERSONA };
+  const DEFAULTS = { name: '', geminiKey: '', groqKey: '', model: C.MODELS[0], speak: true, voice: 'hannah', style: 'soft-cheerful', sounds: true, persona: C.DEFAULT_PERSONA,
+    whatsapp: true, contacts: '', gcid: '', calendar: false, calAdd: true };
   let S = { ...DEFAULTS, ...store.get('settings', {}) };
   const saveSettings = () => store.set('settings', S);
   let history = store.get('history', []);           // [{ role: 'user'|'model', text, sources? }]
@@ -66,17 +67,21 @@
   // ───────── speech bubble ─────────
   const bubble = $('bubble');
   const MAX = 150;
-  let typed = '', target = '', done = false, typer = null, hideTimer = null;
+  let typed = '', target = '', done = false, typer = null, hideTimer = null, actionsHtml = '';
   function placeBubble() {
     const img = imgs[front]; const r = img.getBoundingClientRect(); const st = $('stage').getBoundingClientRect();
     if (!r.height) return;
     const head = r.top + r.height * 0.165 - st.top;            // her head is ~16.5% down the full-body image
+    if (bubble.classList.contains('has-act')) {                // cards with buttons may come down over her
+      bubble.style.bottom = 'auto'; bubble.style.top = '6px'; bubble.style.maxHeight = `${Math.round(st.height * 0.62)}px`; return;
+    }
+    bubble.style.top = 'auto';
     bubble.style.bottom = `${st.height - head + 12}px`;
     bubble.style.maxHeight = `${Math.max(70, head - 16)}px`;           // never taller than the space above her head
   }
   window.addEventListener('resize', placeBubble);
   const esc = (t) => t.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-  function say(html, seconds) { clearInterval(typer); typer = null; bubble.innerHTML = html; bubble.classList.add('show'); placeBubble(); if (seconds) hideIn(seconds); else clearTimeout(hideTimer); }
+  function say(html, seconds) { clearInterval(typer); typer = null; bubble.classList.remove('has-act'); bubble.innerHTML = html; bubble.classList.add('show'); placeBubble(); if (seconds) hideIn(seconds); else clearTimeout(hideTimer); }
   function hide() { bubble.classList.remove('show'); clearInterval(typer); typer = null; }
   function hideIn(sec) { clearTimeout(hideTimer); hideTimer = setTimeout(hide, sec * 1000); }
   const dots = () => say('<span class="dots"><span></span><span></span><span></span></span>');
@@ -86,7 +91,8 @@
       let t = typed, more = false;
       if (t.length > limit) { t = t.slice(0, limit).replace(/\s+\S*$/, ''); more = true; }
       if (done && target.length > limit) more = true;
-      bubble.innerHTML = esc(t) + (more ? `${/[.!?…]$/.test(t) ? '' : '…'} <span class="more">more</span>` : '');
+      bubble.classList.toggle('has-act', !!(done && actionsHtml));
+      bubble.innerHTML = esc(t) + (more ? `${/[.!?…]$/.test(t) ? '' : '…'} <span class="more">more</span>` : '') + (done ? actionsHtml : '');
       bubble.classList.add('show'); placeBubble();
       if (bubble.scrollHeight <= bubble.clientHeight + 12 || limit < 40) break;   // +12: the tail sticks out below
       limit = Math.min(limit, t.length) - 12;
@@ -100,21 +106,28 @@
     }, 60);
   }
   const readTime = (t) => Math.min(25, 3 + C.plain(t).slice(0, MAX).split(/\s+/).length * 0.28);
-  bubble.addEventListener('click', (e) => { if (e.target.classList.contains('more')) openHistory(); else hide(); });
+  bubble.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-act]');
+    if (b) { e.stopPropagation(); runAction(b.dataset.act, Number(b.dataset.i)); return; }
+    if (e.target.closest('a.btn')) { setTimeout(hide, 600); return; }        // WhatsApp link opens by itself
+    if (e.target.classList.contains('more')) openHistory(); else hide();
+  });
 
   // ───────── conversation with Gemini ─────────
   let busy = false;
-  async function geminiStream(useSearch, onChunk) {
+  let calCtx = null;                                   // { events, canAdd } while the calendar is connected
+  async function geminiStream(useSearch, onChunk, model) {
     const contents = history.slice(-16).map((m) => ({ role: m.role === 'model' ? 'model' : 'user', parts: [{ text: m.text }] }));
     const body = {
-      systemInstruction: { parts: [{ text: C.buildSystemPrompt({ persona: S.persona, userName: S.name, memory, now: new Date().toString() }) }] },
+      systemInstruction: { parts: [{ text: C.buildSystemPrompt({ persona: S.persona, userName: S.name, memory, now: new Date().toString(),
+        whatsapp: S.whatsapp, contacts: C.parseContacts(S.contacts).map((c) => c.name), calendar: calCtx }) }] },
       contents,
       generationConfig: { temperature: 0.8, maxOutputTokens: 2048 },
     };
     if (useSearch) body.tools = [{ google_search: {} }];
     let res;
     try {
-      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(S.model)}:streamGenerateContent?alt=sse`, {
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model || S.model)}:streamGenerateContent?alt=sse`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': S.geminiKey.trim() }, body: JSON.stringify(body),
       });
     } catch { throw { status: 0 }; }
@@ -133,10 +146,15 @@
   async function ask(text) {
     if (!text || busy) return;
     if (!S.geminiKey) { openSettings(); return; }
+    if (S.calendar && S.gcid) {
+      const ok = await refreshCalendar();
+      if (ok === 'renewing') { sessionStorage.setItem('aura.pending', text); return; }   // back after Google, then we ask
+    } else calCtx = null;
     busy = true; $('btn-mic').disabled = true;
     history.push({ role: 'user', text }); store.set('history', history);
     dots(); if (!speaking) { clearTimeout(gestureTimer); show('think'); }
     let raw = '', sources = [], gestured = false;
+    actionsHtml = ''; pendingActions = [];
     typed = ''; target = ''; done = false;
     const onChunk = (p) => {
       raw += p.text; for (const s of p.sources) if (!sources.some((x) => x.uri === s.uri)) sources.push(s);
@@ -144,16 +162,34 @@
       if (t.gesture && !gestured) { gestured = true; gesture(t.gesture); }
       if (t.visible) stream(t.visible, false);
     };
-    let attempt = 0, useSearch = true;
+    const LITE = 'gemini-flash-lite-latest';
+    const today = new Date().toDateString();
+    let model = store.get('fallbackDay', '') === today && S.model !== LITE ? LITE : S.model;   // already switched earlier today
+    let waited = false, useSearch = store.get('noSearchDay', '') !== today;
     for (;;) {
-      try { await geminiStream(useSearch, onChunk); break; }
+      try { await geminiStream(useSearch, onChunk, model); break; }
       catch (err) {
         if (raw) break;                                       // partial answer: keep what we have
         if (err.status === 400 && useSearch && !/API key/i.test(err.body || '')) { useSearch = false; continue; }  // model without search
-        if (err.status === 429 && attempt === 0) {
-          attempt++;
-          for (let s = 20; s > 0; s--) { say(`I'm out of breath (Gemini's free limit). Trying again in ${s}s…`); await new Promise((r) => setTimeout(r, 1000)); }
-          dots(); continue;
+        if (err.status === 429) {
+          const q = C.quotaInfo(err.body);
+          if (q.search && useSearch) {                        // Google Search allowance used up: answer without it today
+            useSearch = false; store.set('noSearchDay', today); continue;
+          }
+          if (q.perDay && model !== LITE) {                   // daily quota for this model gone: Flash-Lite has its own
+            model = LITE; store.set('fallbackDay', today);
+            say('Today\'s free Gemini Flash limit is used up, so I\'m switching to Flash-Lite…'); await new Promise((r) => setTimeout(r, 1200)); dots();
+            continue;
+          }
+          if (!q.perDay && !waited) {                         // per-minute limit: wait as long as Google asks
+            waited = true;
+            for (let s = q.wait || 20; s > 0; s--) { say(`I'm out of breath (Gemini's per-minute limit). Trying again in ${s}s…`); await new Promise((r) => setTimeout(r, 1000)); }
+            dots(); continue;
+          }
+          say(`<span class="err">${esc(q.perDay ? `Today's free Gemini limit is used up${model === LITE ? ', on Flash-Lite too' : ''}. It resets at ${C.quotaResetText()}. Turning on billing in Google AI Studio lifts the limit.` : C.friendlyError(429))}</span>`, 12);
+          if (!speaking) show('blink');
+          history.pop(); store.set('history', history);
+          busy = false; $('btn-mic').disabled = false; return;
         }
         say(`<span class="err">${esc(C.friendlyError(err.status, err.body))}</span>`, 9);
         if (!speaking) show('blink');
@@ -165,12 +201,15 @@
     if (!gestured && !speaking) show('blink');
     for (const m of t.memories) if (!memory.includes(m)) memory.push(m);
     memory = memory.slice(-60); store.set('memory', memory);
-    history.push({ role: 'model', text: t.visible, sources }); history = history.slice(-80); store.set('history', history);
-    stream(t.visible, true);
+    pendingActions = t.actions.filter((a) => (a.type === 'whatsapp' && S.whatsapp) || (a.type === 'calendar' && calCtx && calCtx.canAdd));
+    actionsHtml = pendingActions.map(actionCard).join('');
+    const notes = pendingActions.map((a) => a.type === 'whatsapp' ? `\n[WhatsApp draft to ${a.to}: ${a.text}]` : `\n[Calendar event prepared: ${a.title}, ${a.start}${a.end ? '–' + a.end : ''}]`).join('');
+    history.push({ role: 'model', text: t.visible + notes, sources }); history = history.slice(-80); store.set('history', history);
+    stream(t.visible || (pendingActions.length ? 'Here you go:' : ''), true);
     busy = false; $('btn-mic').disabled = false;
-    if (!t.visible) { hide(); return; }
-    const spoke = S.speak && (await speak(t.visible));
-    if (!spoke) hideIn(readTime(t.visible)); else hideIn(2.5);
+    if (!t.visible && !pendingActions.length) { hide(); return; }
+    const spoke = S.speak && t.visible && (await speak(t.visible));
+    if (pendingActions.length) hideIn(45); else if (!spoke) hideIn(readTime(t.visible)); else hideIn(2.5);
   }
 
   // ───────── her voice (Groq Orpheus) ─────────
@@ -276,6 +315,99 @@
     $('text-input').value = ''; $('text-input').blur(); ask(v);
   });
 
+  // ───────── WhatsApp drafts and calendar events ─────────
+  let pendingActions = [];
+  function actionCard(a, i) {
+    if (a.type === 'whatsapp') {
+      const l = C.whatsappLink(a.to, a.text, C.parseContacts(S.contacts));
+      return `<div class="act"><span class="draft">“${esc(a.text)}”</span><a class="btn" href="${l.url}" target="_blank" rel="noopener">${l.direct ? `Send to ${esc(l.name)} on WhatsApp` : 'Open WhatsApp'}</a></div>`;
+    }
+    const st = new Date(C.localToRfc(a.start) || a.start);
+    const when = isNaN(st) ? a.start : st.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    return `<div class="act"><span class="draft">${esc(a.title)} · ${esc(when)}${a.location ? ' · ' + esc(a.location) : ''}</span>` +
+      `<button class="btn" data-act="cal-add" data-i="${i}">Add to calendar</button><button class="btn ghost" data-act="cancel" data-i="${i}">No thanks</button></div>`;
+  }
+  async function runAction(kind, i) {
+    const a = pendingActions[i];
+    if (kind === 'cancel' || !a) { hide(); return; }
+    if (kind === 'cal-add') {
+      const start = C.localToRfc(a.start);
+      let end = C.localToRfc(a.end);
+      if (!start) { say('<span class="err">I couldn\'t read that time. Try asking again with a date and time.</span>', 7); return; }
+      if (!end) end = C.localToRfc(new Date(new Date(start).getTime() + 3600e3 - new Date().getTimezoneOffset() * 60e3).toISOString().slice(0, 16));
+      say('<span class="dots"><span></span><span></span><span></span></span>');
+      try {
+        const r = await calFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ summary: a.title, location: a.location || undefined, start: { dateTime: start }, end: { dateTime: end } }),
+        });
+        if (!r.ok) throw new Error(String(r.status));
+        calCache = 0; gesture('celebrate'); say(esc(`Added “${a.title}” to your calendar!`), 5);
+      } catch (e) { say(`<span class="err">I couldn't add it (${esc(e.message)}). Try reconnecting the calendar in Settings.</span>`, 8); }
+    }
+  }
+
+  // ───────── Google Calendar (sign-in straight from the phone, no server) ─────────
+  const calScope = () => S.calAdd ? 'https://www.googleapis.com/auth/calendar.events' : 'https://www.googleapis.com/auth/calendar.readonly';
+  const redirectUri = () => location.origin + location.pathname.replace(/index\.html$/, '');
+  let calCache = 0;
+  function calConnect(silent) {
+    const state = Math.random().toString(36).slice(2);
+    sessionStorage.setItem('aura.oauthState', state);
+    location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+      client_id: S.gcid.trim(), redirect_uri: redirectUri(), response_type: 'token', scope: calScope(),
+      include_granted_scopes: 'true', state, prompt: silent ? 'none' : 'consent',
+    });
+  }
+  function calToken() { const t = store.get('calToken', null); return t && t.exp > Date.now() && t.scope === calScope() ? t.token : null; }
+  async function calFetch(url, opts = {}) {
+    const tok = calToken(); if (!tok) throw new Error('not signed in');
+    return fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${tok}` } });
+  }
+  async function refreshCalendar() {
+    if (!calToken()) { calConnect(true); return 'renewing'; }        // token expired: quick silent trip to Google
+    if (calCtx && Date.now() - calCache < 5 * 60e3) return true;
+    try {
+      const now = new Date(), until = new Date(now.getTime() + 7 * 864e5);
+      const r = await calFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?' + new URLSearchParams({
+        timeMin: now.toISOString(), timeMax: until.toISOString(), singleEvents: 'true', orderBy: 'startTime', maxResults: '30' }));
+      if (r.status === 401) { store.set('calToken', null); calConnect(true); return 'renewing'; }
+      if (!r.ok) throw new Error(r.status);
+      calCtx = { events: C.formatEvents((await r.json()).items || []), canAdd: S.calAdd }; calCache = Date.now();
+      return true;
+    } catch (e) { console.warn('calendar', e); calCtx = null; return false; }
+  }
+  function handleOAuthReturn() {
+    if (!location.hash.includes('state=')) return false;
+    const h = new URLSearchParams(location.hash.slice(1));
+    window.history.replaceState(null, '', location.pathname);
+    if (h.get('state') !== sessionStorage.getItem('aura.oauthState')) return false;
+    if (h.get('access_token')) {
+      store.set('calToken', { token: h.get('access_token'), exp: Date.now() + (Number(h.get('expires_in')) || 3600) * 1000 - 60e3, scope: calScope() });
+      S.calendar = true; saveSettings();
+      const pending = sessionStorage.getItem('aura.pending'); sessionStorage.removeItem('aura.pending');
+      if (pending) setTimeout(() => ask(pending), 600);
+      else setTimeout(() => { gesture('celebrate'); say('Your Google Calendar is connected!', 5); }, 800);
+    } else if (h.get('error')) {
+      sessionStorage.removeItem('aura.pending');
+      if (h.get('error') === 'access_denied') { S.calendar = false; saveSettings(); }
+      setTimeout(() => say(esc(h.get('error') === 'access_denied' ? 'Okay, I won\'t use your calendar.' : 'I need you to reconnect your calendar: Settings > Connect Google Calendar.'), 8), 800);
+    }
+    return true;
+  }
+  function calStatus() {
+    const el = $('cal-status'), on = S.calendar && S.gcid;
+    el.textContent = on ? (calToken() ? 'Connected' : 'Connected (signs in again when needed)') : 'Not connected';
+    el.classList.toggle('on', !!on);
+    $('btn-cal').textContent = on ? 'Disconnect Google Calendar' : 'Connect Google Calendar';
+  }
+  $('btn-cal').addEventListener('click', () => {
+    readSettings();
+    if (S.calendar) { S.calendar = false; store.set('calToken', null); calCtx = null; saveSettings(); calStatus(); return; }
+    if (!S.gcid) { alert('First paste your Google OAuth Client ID (see the setup guide).'); return; }
+    calConnect(false);
+  });
+
   // ───────── conversation sheet ─────────
   function openHistory() {
     const list = $('history-list'); list.innerHTML = '';
@@ -310,13 +442,15 @@
     $('s-name').value = S.name; $('s-gemini').value = S.geminiKey; $('s-groq').value = S.groqKey;
     $('s-model').value = S.model; $('s-speak').checked = S.speak; $('s-voice').value = S.voice; $('s-style').value = S.style;
     $('s-sounds').checked = S.sounds; $('s-persona').value = S.persona;
+    $('s-wa').checked = S.whatsapp; $('s-contacts').value = S.contacts; $('s-gcid').value = S.gcid; $('s-caladd').checked = S.calAdd; calStatus();
     renderMemory(); $('settings').hidden = false;
   }
   function readSettings() {
     const oldVoice = S.voice;
     S = { ...S, name: $('s-name').value.trim(), geminiKey: $('s-gemini').value.trim(), groqKey: $('s-groq').value.trim(), model: $('s-model').value,
       speak: $('s-speak').checked, voice: $('s-voice').value, style: $('s-style').value, sounds: $('s-sounds').checked,
-      persona: $('s-persona').value.trim() || C.DEFAULT_PERSONA };
+      persona: $('s-persona').value.trim() || C.DEFAULT_PERSONA,
+      whatsapp: $('s-wa').checked, contacts: $('s-contacts').value.trim(), gcid: $('s-gcid').value.trim(), calAdd: $('s-caladd').checked };
     saveSettings();
     if (oldVoice !== S.voice) lastSound = 0;
   }
@@ -341,6 +475,7 @@
   // ───────── start ─────────
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   imgs[0].addEventListener('load', placeBubble);
-  if (!S.geminiKey || !S.groqKey) openSettings(true); else greet();
+  const backFromGoogle = handleOAuthReturn() !== false;
+  if (!S.geminiKey || !S.groqKey) openSettings(true); else if (!backFromGoogle) greet();
   window.Aura = { ask, gesture, say, openSettings, openHistory };   // handy for testing
 })();

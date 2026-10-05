@@ -73,6 +73,19 @@
     <label class="row">Little sounds<input id="s-sounds" type="checkbox"></label>
     <label>Personality<textarea id="s-persona" rows="6"></textarea></label>
     <p class="note">Tip: paste the text of your Mac's <code>~/.cloe/soul.md</code> here so Mira is the same person on both.</p>
+    <h3 class="sec">Connections</h3>
+    <label class="row">WhatsApp drafts<input id="s-wa" type="checkbox"></label>
+    <label>WhatsApp contacts (one per line)<textarea id="s-contacts" rows="3" placeholder="Budi: 0812 3456 7890&#10;Wife: 0811 222 333"></textarea></label>
+    <p class="note">Mira writes the message and opens WhatsApp with it typed in; you tap Send. Names not listed here open WhatsApp's contact picker.</p>
+    <div class="conn">
+      <div class="conn-head"><b>Google Calendar</b><span id="cal-status">Not connected</span></div>
+      <label>Google OAuth Client ID<input id="s-gcid" type="text" placeholder="…apps.googleusercontent.com" autocapitalize="off" spellcheck="false"></label>
+      <label class="row">Let Mira add events<input id="s-caladd" type="checkbox"></label>
+      <button id="btn-cal" class="wide alt">Connect Google Calendar</button>
+      <p class="note">She reads your next 7 days. New events always ask for your tap first.</p>
+    </div>
+    <div class="conn soon"><div class="conn-head"><b>Chat with Mira in WhatsApp</b><span>Coming next</span></div>
+      <p class="note">Her own WhatsApp number, so you can message her like a contact. Needs a small free server; we set it up next.</p></div>
     <div id="s-memory-box"><b>Things Mira remembers</b><ul id="s-memory"></ul></div>
     <button id="btn-test-voice" class="wide">Test her voice</button>
     <p class="note small">Aura for iPhone · based on cloe-desktop (MIT)</p>

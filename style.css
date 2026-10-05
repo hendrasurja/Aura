@@ -91,3 +91,18 @@ button.wide { width: 100%; margin-top: 18px; padding: 13px; border-radius: 14px;
 .msg .src { display: block; margin-top: 8px; font-size: 13px; }
 .msg .src a { color: var(--accent); text-decoration: none; display: block; margin-top: 2px; }
 .empty { color: var(--sub); text-align: center; margin-top: 40px; }
+
+h3.sec { margin: 26px 0 0; font-size: 13px; letter-spacing: 1px; text-transform: uppercase; color: var(--accent); }
+.conn { margin-top: 16px; padding: 12px 14px 14px; border-radius: 14px; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.08); }
+.conn-head { display: flex; justify-content: space-between; align-items: center; }
+.conn-head span { font-size: 13px; color: var(--sub); }
+.conn-head span.on { color: #8ff0b4; }
+.conn.soon { opacity: .6; }
+button.wide.alt { background: rgba(242,200,224,.16); color: var(--accent); border: 1px solid rgba(242,200,224,.5); margin-top: 12px; }
+#bubble .act { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(242,200,224,.25); font-size: 15px; }
+#bubble .act .draft { color: var(--sub); font-style: italic; display: block; margin-bottom: 8px; }
+#bubble .act .btn { display: inline-block; padding: 8px 14px; border-radius: 12px; border: 0; background: var(--accent); color: #1b2160;
+  font-weight: 700; font-size: 15px; text-decoration: none; margin-right: 8px; }
+#bubble .act .btn.ghost { background: transparent; color: var(--accent); border: 1px solid rgba(242,200,224,.5); }
+#bubble.has-act::after { display: none; }
+#bubble.has-act { max-width: min(90vw, 380px); }

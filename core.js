@@ -24,7 +24,7 @@
     'You talk like a close friend: natural, concise, sometimes a little teasing, never robotic or overly formal. ' +
     'You are also genuinely capable: you search the web for anything current and help with work, research and everyday questions.';
 
-  function buildSystemPrompt({ persona, userName, memory, now }) {
+  function buildSystemPrompt({ persona, userName, memory, now, whatsapp, contacts, calendar }) {
     const parts = [String(persona || DEFAULT_PERSONA).trim()];
     if (userName) parts.push(`The user's name is ${userName}.`);
     if (memory && memory.length) parts.push('Things you remember about the user:\n' + memory.map((m) => `- ${m}`).join('\n'));
@@ -38,6 +38,19 @@
       'When the user tells you something worth remembering long-term (their preferences, people, plans), add [remember: one short fact] at the very end of your reply. It is hidden from the user.',
       'Use Google Search for anything current: news, prices, weather, schedules, recent events.',
     ].join('\n'));
+    if (whatsapp) {
+      parts.push('WhatsApp: when the user asks you to send, tell or message someone on WhatsApp, write the message for them in the user\'s own voice ' +
+        '(first person, as the user, short and natural, in the language they would use with that person) and add [whatsapp: Name | message text] at the very end of your reply. ' +
+        'Briefly say in your reply that you drafted it; the user taps a button to open WhatsApp and send it themselves. ' +
+        (contacts && contacts.length ? `Saved WhatsApp contacts: ${contacts.join(', ')}.` : 'No contacts are saved; use the name the user gives.'));
+    }
+    if (calendar) {
+      parts.push(`Google Calendar (the user's, local time). Upcoming events, next 7 days:\n${calendar.events || '(none)'}\n` +
+        'Answer schedule questions from this list. ' +
+        (calendar.canAdd
+          ? 'To add an event when asked, add [calendar_add: Title | YYYY-MM-DDTHH:MM | YYYY-MM-DDTHH:MM | Location] at the very end (start, end, local time; end = start + 1 hour if not given; location may be empty). The user confirms with a button before it is added; say you have prepared it.'
+          : 'You can read the calendar but not add events: if asked to add one, say they can switch that on in Settings.'));
+    }
     return parts.join('\n\n');
   }
 
@@ -78,10 +91,20 @@
     else if (/^\s*\[[a-z_]*$/i.test(s)) { pending = true; s = ''; }        // "[lau" — wait for the rest
     const memories = [];
     s = s.replace(/\[remember:\s*([^\]]+)\]/gi, (_, m) => { memories.push(m.trim()); return ''; });
+    const actions = [];
+    s = s.replace(/\[(whatsapp|calendar_add):\s*([^\]]+)\]/gi, (_, kind, body) => {
+      const f = body.split('|').map((x) => x.trim());
+      if (kind.toLowerCase() === 'whatsapp' && f.length >= 2) actions.push({ type: 'whatsapp', to: f[0], text: f.slice(1).join(' | ') });
+      if (kind.toLowerCase() === 'calendar_add' && f.length >= 2) actions.push({ type: 'calendar', title: f[0], start: f[1], end: f[2] || '', location: f[3] || '' });
+      return '';
+    });
     const tail = s.match(/\[([^\]]*)$/);                                        // a tag still arriving at the end
-    if (tail) { const t = tail[1].toLowerCase(); if ('remember:'.startsWith(t) || t.startsWith('remember:')) s = s.slice(0, tail.index); }
+    if (tail) {
+      const t = tail[1].toLowerCase();
+      if (['remember:', 'whatsapp:', 'calendar_add:'].some((k) => k.startsWith(t) || t.startsWith(k))) s = s.slice(0, tail.index);
+    }
     s = s.replace(/\[(smile|laugh|surprise|nod|shake_head|think|proud|shy|tease|wave|kiss|heart|celebrate|sad|dance|clap|yawn|drink)\]/gi, '');
-    return { gesture, visible: s.replace(/[ \t]{2,}/g, ' ').replace(/ ([.,!?])/g, '$1').replace(/[ \t]+\n/g, '\n').trim(), memories, pending };
+    return { actions, gesture, visible: s.replace(/[ \t]{2,}/g, ' ').replace(/ ([.,!?])/g, '$1').replace(/[ \t]+\n/g, '\n').trim(), memories, pending };
   }
 
   /** Plain text for the bubble and the voice (markdown removed). */
@@ -127,6 +150,70 @@
     return `Something went wrong (${status}).`;
   }
 
-  const api = { GIF_MS, GESTURES, SOUND_LINES, STYLES, VOICES, MODELS, DEFAULT_PERSONA, buildSystemPrompt, parseSSE, eventPayload, splitTags, plain, splitForTts, friendlyError };
+  /** Read Gemini's 429 details: which limit (per minute / per day / Google Search) and how long to wait. */
+  function quotaInfo(body) {
+    let j = null; try { j = JSON.parse(body); } catch { /* not JSON */ }
+    const details = (j && j.error && j.error.details) || [];
+    const ids = [];
+    let wait = 0;
+    for (const d of details) {
+      for (const v of d.violations || []) ids.push(`${v.quotaId || ''} ${v.quotaMetric || ''}`);
+      if (d.retryDelay) wait = parseFloat(String(d.retryDelay)) || 0;
+    }
+    const all = ids.join(' ') + ' ' + String((j && j.error && j.error.message) || body || '');
+    return {
+      perDay: /PerDay/i.test(all),
+      search: /search|grounding/i.test(all),
+      wait: Math.min(60, Math.max(0, Math.round(wait))),
+    };
+  }
+
+  /** When the daily free quota resets (midnight US Pacific), as local time text, e.g. "2:00 PM". */
+  function quotaResetText(now = new Date()) {
+    const la = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    const offset = now.getTime() - la.getTime();
+    const next = new Date(la); next.setHours(24, 0, 0, 0);
+    return new Date(next.getTime() + offset).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+
+  /** "Budi: 0812-3456-789" lines -> [{ name, phone }] with an international number (Indonesian 0… -> 62…). */
+  function parseContacts(text) {
+    return String(text || '').split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
+      const m = l.match(/^(.+?)[:=,]\s*(\+?[\d\s().-]{6,})$/);
+      if (!m) return null;
+      let phone = m[2].replace(/\D/g, '');
+      if (phone.startsWith('0')) phone = '62' + phone.slice(1);
+      return { name: m[1].trim(), phone };
+    }).filter(Boolean);
+  }
+  /** WhatsApp link: straight to the contact if we know the number, otherwise WhatsApp's contact picker. */
+  function whatsappLink(to, text, contacts) {
+    const c = (contacts || []).find((x) => x.name.toLowerCase() === String(to || '').toLowerCase())
+      || (contacts || []).find((x) => x.name.toLowerCase().startsWith(String(to || '').toLowerCase().split(' ')[0]));
+    const digits = c ? c.phone : (/^\+?\d[\d\s-]{6,}$/.test(String(to || '').trim()) ? String(to).replace(/\D/g, '') : '');
+    return { url: `https://wa.me/${digits}?text=${encodeURIComponent(text)}`, direct: !!digits, name: c ? c.name : to };
+  }
+  /** "2026-10-06T12:00" (local) -> RFC 3339 with the phone's timezone offset. */
+  function localToRfc(s) {
+    const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+    if (!m) return null;
+    const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+    if (isNaN(d)) return null;
+    const off = -d.getTimezoneOffset(), sign = off >= 0 ? '+' : '-', a = Math.abs(off);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}`;
+  }
+  /** Calendar API items -> compact lines for Mira. */
+  function formatEvents(items) {
+    const fmtDay = (d) => d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+    const fmtTime = (d) => d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    return (items || []).slice(0, 30).map((e) => {
+      if (e.start && e.start.date) return `- ${fmtDay(new Date(e.start.date + 'T00:00'))} (all day) ${e.summary || 'Busy'}`;
+      const s = new Date(e.start && e.start.dateTime), en = new Date(e.end && e.end.dateTime);
+      return `- ${fmtDay(s)} ${fmtTime(s)}–${fmtTime(en)} ${e.summary || 'Busy'}${e.location ? ` (${e.location})` : ''}`;
+    }).join('\n');
+  }
+
+  const api = { parseContacts, whatsappLink, localToRfc, formatEvents, quotaInfo, quotaResetText, GIF_MS, GESTURES, SOUND_LINES, STYLES, VOICES, MODELS, DEFAULT_PERSONA, buildSystemPrompt, parseSSE, eventPayload, splitTags, plain, splitForTts, friendlyError };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.AuraCore = api;
 })(typeof window !== 'undefined' ? window : globalThis);
