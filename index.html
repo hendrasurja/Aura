@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Aura">
+<meta name="theme-color" content="#141c4a">
+<title>Aura</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header id="top">
+    <button id="btn-history" class="icon-btn" aria-label="Conversation">
+      <svg viewBox="0 0 24 24"><path d="M4 5h16v10H8l-4 4z"/></svg>
+    </button>
+    <div id="title">Aura</div>
+    <button id="btn-settings" class="icon-btn" aria-label="Settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></svg>
+    </button>
+  </header>
+
+  <main id="stage">
+    <div id="mira">
+      <img id="gif-a" class="gif show" alt="Mira" src="gifs/blink.gif" draggable="false">
+      <img id="gif-b" class="gif" alt="" draggable="false">
+    </div>
+    <div id="bubble" aria-live="polite"></div>
+  </main>
+
+  <footer id="controls">
+    <form id="text-row" autocomplete="off">
+      <input id="text-input" type="text" placeholder="Message Mira…" enterkeyhint="send">
+      <button id="btn-send" type="submit" aria-label="Send">
+        <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5z"/></svg>
+      </button>
+    </form>
+    <div id="mic-row">
+      <button id="btn-keyboard" class="icon-btn" aria-label="Type instead">
+        <svg viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10"/></svg>
+      </button>
+      <button id="btn-mic" aria-label="Hold to talk">
+        <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
+      </button>
+      <div class="icon-btn spacer"></div>
+    </div>
+    <div id="hint">Hold to talk</div>
+  </footer>
+</div>
+
+<section id="history" class="sheet" hidden>
+  <div class="sheet-head"><b>Conversation</b><button class="link" id="btn-clear">Clear</button><button class="close" data-close>Done</button></div>
+  <div id="history-list"></div>
+</section>
+
+<section id="settings" class="sheet" hidden>
+  <div class="sheet-head"><b>Settings</b><button class="close" data-close>Done</button></div>
+  <div class="sheet-body">
+    <p id="welcome" class="note" hidden>Welcome! Mira needs your two free keys. They are saved only on this iPhone and sent only to Google and Groq.</p>
+    <label>Your name<input id="s-name" type="text" placeholder="So Mira knows what to call you"></label>
+    <label>Gemini API key<input id="s-gemini" type="password" placeholder="From aistudio.google.com" autocapitalize="off" spellcheck="false"></label>
+    <label>Groq API key<input id="s-groq" type="password" placeholder="From console.groq.com (voice)" autocapitalize="off" spellcheck="false"></label>
+    <label>Model<select id="s-model"></select></label>
+    <label class="row">Speak replies<input id="s-speak" type="checkbox"></label>
+    <label>Voice<select id="s-voice"></select></label>
+    <label>Voice style<select id="s-style"></select></label>
+    <label class="row">Little sounds<input id="s-sounds" type="checkbox"></label>
+    <label>Personality<textarea id="s-persona" rows="6"></textarea></label>
+    <p class="note">Tip: paste the text of your Mac's <code>~/.cloe/soul.md</code> here so Mira is the same person on both.</p>
+    <div id="s-memory-box"><b>Things Mira remembers</b><ul id="s-memory"></ul></div>
+    <button id="btn-test-voice" class="wide">Test her voice</button>
+    <p class="note small">Aura for iPhone · based on cloe-desktop (MIT)</p>
+  </div>
+</section>
+
+<script src="core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
