@@ -11,11 +11,16 @@
 
   // ───────── settings ─────────
   const DEFAULTS = { name: '', geminiKey: '', groqKey: '', model: C.MODELS[0], speak: true, voice: 'hannah', style: 'soft-cheerful', sounds: true, persona: C.DEFAULT_PERSONA,
-    whatsapp: true, contacts: '', gcid: '', calendar: false, calAdd: true };
+    whatsapp: true, contacts: '', gcid: '', calendar: false, calAdd: true, pool: null, shareCalendar: false };
   let S = { ...DEFAULTS, ...store.get('settings', {}) };
   const saveSettings = () => store.set('settings', S);
   let history = store.get('history', []);           // [{ role: 'user'|'model', text, sources? }]
   let memory = store.get('memory', []);              // ['fact', …]
+  // brains: the pool of AI providers, tried in order; resting ones come back by themselves
+  const pool = () => { if (!Array.isArray(S.pool)) { S.pool = C.defaultPool(S.model); saveSettings(); } return S.pool; };
+  let health = store.get('health', {});
+  const setHealth = (h) => { health = h; store.set('health', h); };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ───────── audio (iOS needs a tap before any sound) ─────────
   let ctx = null;
@@ -116,11 +121,35 @@
   // ───────── conversation with Gemini ─────────
   let busy = false;
   let calCtx = null;                                   // { events, canAdd } while the calendar is connected
-  async function geminiStream(useSearch, onChunk, model) {
+  const promptFor = (type, search) => C.buildSystemPrompt({ persona: S.persona, userName: S.name, memory, now: new Date().toString(),
+    whatsapp: S.whatsapp, contacts: C.parseContacts(S.contacts).map((c) => c.name),
+    calendar: (type === 'gemini' || S.shareCalendar) ? calCtx : null, search });      // calendar goes to backup brains only if allowed
+  async function pump(res, map, onChunk) {
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+    for (;;) {
+      const { value, done: end } = await reader.read();
+      if (end) break;
+      buf += dec.decode(value, { stream: true });
+      const r = C.parseSSE(buf); buf = r.rest;
+      for (const ev of r.events) onChunk(map(ev));
+    }
+    if (buf.trim()) for (const ev of C.parseSSE(buf + '\n\n').events) onChunk(map(ev));
+  }
+  async function openaiStream(entry, onChunk) {
+    const msgs = [{ role: 'system', content: promptFor('openai', false) },
+      ...history.slice(-16).map((m) => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.text }))];
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${entry.key}` };
+    if (/openrouter\.ai/.test(entry.base)) headers['X-Title'] = 'Aura';
+    let res;
+    try { res = await fetch(`${entry.base}/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: entry.model, messages: msgs, stream: true, temperature: 0.8, max_tokens: 1500 }) }); }
+    catch { throw { status: 0 }; }
+    if (!res.ok) throw { status: res.status, body: await res.text().catch(() => '') };
+    await pump(res, C.openaiPayload, onChunk);
+  }
+  async function geminiStream(useSearch, onChunk, model, key) {
     const contents = history.slice(-16).map((m) => ({ role: m.role === 'model' ? 'model' : 'user', parts: [{ text: m.text }] }));
     const body = {
-      systemInstruction: { parts: [{ text: C.buildSystemPrompt({ persona: S.persona, userName: S.name, memory, now: new Date().toString(),
-        whatsapp: S.whatsapp, contacts: C.parseContacts(S.contacts).map((c) => c.name), calendar: calCtx }) }] },
+      systemInstruction: { parts: [{ text: promptFor('gemini', useSearch) }] },
       contents,
       generationConfig: { temperature: 0.8, maxOutputTokens: 2048 },
     };
@@ -128,24 +157,16 @@
     let res;
     try {
       res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model || S.model)}:streamGenerateContent?alt=sse`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': S.geminiKey.trim() }, body: JSON.stringify(body),
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': String(key || S.geminiKey).trim() }, body: JSON.stringify(body),
       });
     } catch { throw { status: 0 }; }
     if (!res.ok) throw { status: res.status, body: await res.text().catch(() => '') };
-    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
-    for (;;) {
-      const { value, done: end } = await reader.read();
-      if (end) break;
-      buf += dec.decode(value, { stream: true });
-      const r = C.parseSSE(buf); buf = r.rest;
-      for (const ev of r.events) onChunk(C.eventPayload(ev));
-    }
-    if (buf.trim()) for (const ev of C.parseSSE(buf + '\n\n').events) onChunk(C.eventPayload(ev));
+    await pump(res, C.eventPayload, onChunk);
   }
 
   async function ask(text) {
     if (!text || busy) return;
-    if (!S.geminiKey) { openSettings(); return; }
+    if (!C.available(pool(), S, {}).length) { openSettings(); return; }
     if (S.calendar && S.gcid) {
       const ok = await refreshCalendar();
       if (ok === 'renewing') { sessionStorage.setItem('aura.pending', text); return; }   // back after Google, then we ask
@@ -162,41 +183,46 @@
       if (t.gesture && !gestured) { gestured = true; gesture(t.gesture); }
       if (t.visible) stream(t.visible, false);
     };
-    const LITE = 'gemini-flash-lite-latest';
     const today = new Date().toDateString();
-    let model = store.get('fallbackDay', '') === today && S.model !== LITE ? LITE : S.model;   // already switched earlier today
-    let waited = false, useSearch = store.get('noSearchDay', '') !== today;
-    for (;;) {
-      try { await geminiStream(useSearch, onChunk, model); break; }
-      catch (err) {
-        if (raw) break;                                       // partial answer: keep what we have
-        if (err.status === 400 && useSearch && !/API key/i.test(err.body || '')) { useSearch = false; continue; }  // model without search
-        if (err.status === 429) {
-          const q = C.quotaInfo(err.body);
-          if (q.search && useSearch) {                        // Google Search allowance used up: answer without it today
-            useSearch = false; store.set('noSearchDay', today); continue;
-          }
-          if (q.perDay && model !== LITE) {                   // daily quota for this model gone: Flash-Lite has its own
-            model = LITE; store.set('fallbackDay', today);
-            say('Today\'s free Gemini Flash limit is used up, so I\'m switching to Flash-Lite…'); await new Promise((r) => setTimeout(r, 1200)); dots();
-            continue;
-          }
-          if (!q.perDay && !waited) {                         // per-minute limit: wait as long as Google asks
-            waited = true;
-            for (let s = q.wait || 20; s > 0; s--) { say(`I'm out of breath (Gemini's per-minute limit). Trying again in ${s}s…`); await new Promise((r) => setTimeout(r, 1000)); }
-            dots(); continue;
-          }
-          say(`<span class="err">${esc(q.perDay ? `Today's free Gemini limit is used up${model === LITE ? ', on Flash-Lite too' : ''}. It resets at ${C.quotaResetText()}. Turning on billing in Google AI Studio lifts the limit.` : C.friendlyError(429))}</span>`, 12);
-          if (!speaking) show('blink');
-          history.pop(); store.set('history', history);
-          busy = false; $('btn-mic').disabled = false; return;
+    const failAndReturn = () => { if (!speaking) show('blink'); history.pop(); store.set('history', history); busy = false; $('btn-mic').disabled = false; };
+    const attempt = async (entry) => {
+      if (entry.type !== 'gemini') return openaiStream(entry, onChunk);
+      let useSearch = store.get('noSearchDay', '') !== today;
+      for (;;) {
+        try { return await geminiStream(useSearch, onChunk, entry.model, entry.key); }
+        catch (err) {
+          if (raw) throw err;
+          if (err.status === 400 && useSearch && !/API key/i.test(err.body || '')) { useSearch = false; continue; }        // model without search
+          if (err.status === 429 && useSearch && C.quotaInfo(err.body).search) { useSearch = false; store.set('noSearchDay', today); continue; }  // search allowance used up
+          throw err;
         }
-        say(`<span class="err">${esc(C.friendlyError(err.status, err.body))}</span>`, 9);
-        if (!speaking) show('blink');
-        history.pop(); store.set('history', history);
-        busy = false; $('btn-mic').disabled = false; return;
+      }
+    };
+    let used = null, waitedOnce = false;
+    attempts: for (;;) {
+      const order = C.available(pool(), S, health);
+      if (!order.length) {
+        const back = C.soonestReturn(pool(), S, health);
+        if (!waitedOnce && back && back - Date.now() <= 25000) {         // a very short rest: wait for it
+          waitedOnce = true;
+          for (let s = Math.ceil((back - Date.now()) / 1000); s > 0; s--) { say(`I'm catching my breath… ${s}s`); await sleep(1000); }
+          dots(); continue;
+        }
+        const sum = C.restingSummary(pool(), S, health);
+        say(`<span class="err">${esc(sum ? `All my brains are resting right now: ${sum}.` : 'I have no brain to think with. Add a key in Settings.')}</span>`, 15);
+        updateVia(); failAndReturn(); return;
+      }
+      for (const entry of order) {
+        try { await attempt(entry); used = entry; break attempts; }
+        catch (err) {
+          if (raw) { used = entry; break attempts; }                      // partial answer: keep what we have
+          const cls = C.classifyFailure({ status: err.status, body: err.body, type: entry.type, fails: (health[entry.id] || {}).fails || 0 });
+          console.warn('brain failed', entry.label, err.status, cls);
+          setHealth(C.markFail(health, entry.id, cls)); updateVia();
+        }
       }
     }
+    setHealth(C.markOk(health, used.id)); updateVia();
     const t = C.splitTags(raw);
     if (!gestured && !speaking) show('blink');
     for (const m of t.memories) if (!memory.includes(m)) memory.push(m);
@@ -204,7 +230,7 @@
     pendingActions = t.actions.filter((a) => (a.type === 'whatsapp' && S.whatsapp) || (a.type === 'calendar' && calCtx && calCtx.canAdd));
     actionsHtml = pendingActions.map(actionCard).join('');
     const notes = pendingActions.map((a) => a.type === 'whatsapp' ? `\n[WhatsApp draft to ${a.to}: ${a.text}]` : `\n[Calendar event prepared: ${a.title}, ${a.start}${a.end ? '–' + a.end : ''}]`).join('');
-    history.push({ role: 'model', text: t.visible + notes, sources }); history = history.slice(-80); store.set('history', history);
+    history.push({ role: 'model', text: t.visible + notes, sources, via: used.label }); history = history.slice(-80); store.set('history', history);
     stream(t.visible || (pendingActions.length ? 'Here you go:' : ''), true);
     busy = false; $('btn-mic').disabled = false;
     if (!t.visible && !pendingActions.length) { hide(); return; }
@@ -313,6 +339,83 @@
   $('text-row').addEventListener('submit', (e) => {
     e.preventDefault(); const v = $('text-input').value.trim(); if (!v) return;
     $('text-input').value = ''; $('text-input').blur(); ask(v);
+  });
+
+  // ───────── which brain is thinking ─────────
+  function updateVia() {
+    const all = pool().map((e) => C.describe(e, S)).filter((e) => e.enabled && e.key);
+    const now = C.available(pool(), S, health)[0];
+    $('via').textContent = all.length && now && now.id !== all[0].id ? `via ${now.label}` : '';
+  }
+  setInterval(() => { updateVia(); }, 20000);
+
+  // ───────── brains in Settings ─────────
+  function el(tag, props = {}, kids = []) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) { if (k === 'class') n.className = v; else if (k === 'text') n.textContent = v; else if (k.startsWith('on')) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v); }
+    for (const c of [].concat(kids)) if (c) n.appendChild(c);
+    return n;
+  }
+  const errText = (body) => { try { const j = JSON.parse(body); return String((j.error && (j.error.message || j.error)) || j.message || '').split('\n')[0].slice(0, 140); } catch { return String(body || '').slice(0, 100); } };
+  async function testEntry(raw, out, chip) {
+    const e = C.describe(raw, S);
+    const refreshChip = () => { const st = C.statusOf(raw, S, health); chip.className = `chip ${st.state}`; chip.textContent = st.text; };
+    out.className = 'test-out'; out.textContent = 'Testing…';
+    try {
+      let r;
+      if (e.type === 'gemini') {
+        r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(e.model)}:generateContent`, { method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': e.key }, body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Say OK' }] }], generationConfig: { maxOutputTokens: 8 } }) });
+      } else {
+        const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${e.key}` };
+        if (/openrouter\.ai/.test(e.base)) headers['X-Title'] = 'Aura';
+        r = await fetch(`${e.base}/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: e.model, messages: [{ role: 'user', content: 'Say OK' }], max_tokens: 8 }) });
+      }
+      if (r.ok) { setHealth(C.markOk(health, e.id)); out.className = 'test-out ok'; out.textContent = `Working: ${e.model} answered.`; updateVia(); refreshChip(); return; }
+      const body = await r.text().catch(() => '');
+      const cls = C.classifyFailure({ status: r.status, body, type: e.type, fails: 0 });
+      setHealth(C.markFail(health, e.id, cls)); updateVia(); refreshChip();
+      out.className = 'test-out bad'; out.textContent = `${cls.why[0].toUpperCase() + cls.why.slice(1)} (${r.status}). ${errText(body)}`;
+      if ((r.status === 404 || r.status === 400) && e.type === 'openai') {          // wrong model name: offer the real ones
+        try {
+          const l = await fetch(`${e.base}/models`, { headers: { Authorization: `Bearer ${e.key}` } });
+          const ids = ((await l.json()).data || []).map((m) => m.id).filter((id) => !/whisper|embed|tts|guard|moderation|image|rerank/i.test(id)).slice(0, 12);
+          if (ids.length) { out.appendChild(el('div', { class: 'pick', text: 'Models on offer, tap one:' }, ids.map((id) => el('button', { class: 'chipbtn', text: id, onclick: () => { raw.model = id; saveSettings(); renderBrains(); } })))); }
+        } catch { /* no list available */ }
+      }
+    } catch { out.className = 'test-out bad'; out.textContent = 'Couldn\'t reach it from the phone browser. The address may be wrong, or this provider may not allow browser apps.'; setHealth(C.markFail(health, e.id, { k: 'network', ms: 120000, why: 'can\'t be reached from here' })); updateVia(); refreshChip(); }
+  }
+  function renderBrains() {
+    const box = $('brains'); if (!box) return; box.innerHTML = '';
+    const list = pool(), now = Date.now();
+    list.forEach((raw, i) => {
+      const e = C.describe(raw, S), st = C.statusOf(raw, S, health, now), m = e.meta;
+      const out = el('div', { class: 'test-out' });
+      const chip = el('span', { class: `chip ${st.state}`, text: st.text });
+      const card = el('div', { class: `brain ${st.state}` }, [
+        el('div', { class: 'brain-head' }, [el('b', { text: e.label }), chip]),
+        el('div', { class: 'brain-note', text: m.shared ? m.note : e.type === 'gemini' ? 'Uses your Gemini key above. Separate free quota per model.' : m.note }),
+      ]);
+      if (e.type === 'openai' && !m.shared) card.appendChild(el('input', { type: 'password', placeholder: 'API key', value: raw.key || '', autocapitalize: 'off', spellcheck: 'false', oninput: (ev) => { raw.key = ev.target.value.trim(); saveSettings(); } }));
+      if (raw.kind === 'custom') card.appendChild(el('input', { type: 'text', placeholder: 'Address, e.g. https://api.example.com/v1', value: raw.base || '', autocapitalize: 'off', oninput: (ev) => { raw.base = ev.target.value.trim(); saveSettings(); } }));
+      card.appendChild(el('input', { type: 'text', placeholder: 'Model', value: raw.model || e.model, autocapitalize: 'off', spellcheck: 'false', oninput: (ev) => { raw.model = ev.target.value.trim(); if (raw.id === 'gemini') { S.model = raw.model; } saveSettings(); } }));
+      const tools = el('div', { class: 'brain-tools' }, [
+        el('label', { class: 'mini' }, [el('input', { type: 'checkbox', ...(raw.enabled ? { checked: '' } : {}), onchange: (ev) => { raw.enabled = ev.target.checked; saveSettings(); updateVia(); renderBrains(); } }), el('span', { text: 'On' })]),
+        el('button', { text: '▲', 'aria-label': 'Move up', onclick: () => { if (i > 0) { [list[i - 1], list[i]] = [list[i], list[i - 1]]; saveSettings(); renderBrains(); updateVia(); } } }),
+        el('button', { text: '▼', 'aria-label': 'Move down', onclick: () => { if (i < list.length - 1) { [list[i + 1], list[i]] = [list[i], list[i + 1]]; saveSettings(); renderBrains(); updateVia(); } } }),
+        el('button', { text: 'Test', onclick: () => testEntry(raw, out, chip) }),
+        m.keyUrl ? el('a', { href: m.keyUrl, target: '_blank', rel: 'noopener', text: 'Get a key ↗' }) : null,
+        raw.id !== 'gemini' ? el('button', { class: 'rm', text: 'Remove', onclick: () => { list.splice(i, 1); saveSettings(); renderBrains(); updateVia(); } }) : null,
+      ]);
+      card.appendChild(tools); card.appendChild(out); box.appendChild(card);
+    });
+  }
+  const addSel = $('brain-add');
+  addSel.innerHTML = '<option value="">Add another brain…</option>' + Object.entries(C.CATALOG).filter(([k]) => k !== 'gemini').map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join('');
+  addSel.addEventListener('change', () => {
+    const kind = addSel.value; if (!kind) return;
+    pool().push({ id: `${kind}-${Date.now().toString(36)}`, kind, key: '', enabled: true });
+    addSel.value = ''; saveSettings(); renderBrains();
   });
 
   // ───────── WhatsApp drafts and calendar events ─────────
@@ -442,6 +545,7 @@
     $('s-name').value = S.name; $('s-gemini').value = S.geminiKey; $('s-groq').value = S.groqKey;
     $('s-model').value = S.model; $('s-speak').checked = S.speak; $('s-voice').value = S.voice; $('s-style').value = S.style;
     $('s-sounds').checked = S.sounds; $('s-persona').value = S.persona;
+    $('s-sharecal').checked = S.shareCalendar; renderBrains();
     $('s-wa').checked = S.whatsapp; $('s-contacts').value = S.contacts; $('s-gcid').value = S.gcid; $('s-caladd').checked = S.calAdd; calStatus();
     renderMemory(); $('settings').hidden = false;
   }
@@ -450,8 +554,9 @@
     S = { ...S, name: $('s-name').value.trim(), geminiKey: $('s-gemini').value.trim(), groqKey: $('s-groq').value.trim(), model: $('s-model').value,
       speak: $('s-speak').checked, voice: $('s-voice').value, style: $('s-style').value, sounds: $('s-sounds').checked,
       persona: $('s-persona').value.trim() || C.DEFAULT_PERSONA,
-      whatsapp: $('s-wa').checked, contacts: $('s-contacts').value.trim(), gcid: $('s-gcid').value.trim(), calAdd: $('s-caladd').checked };
-    saveSettings();
+      shareCalendar: $('s-sharecal').checked, whatsapp: $('s-wa').checked, contacts: $('s-contacts').value.trim(), gcid: $('s-gcid').value.trim(), calAdd: $('s-caladd').checked };
+    { const g = (S.pool || []).find((e) => e.id === 'gemini'); if (g) g.model = S.model; }
+    saveSettings(); updateVia();
     if (oldVoice !== S.voice) lastSound = 0;
   }
   $('btn-settings').addEventListener('click', () => openSettings(false));
@@ -476,6 +581,7 @@
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   imgs[0].addEventListener('load', placeBubble);
   const backFromGoogle = handleOAuthReturn() !== false;
+  updateVia();
   if (!S.geminiKey || !S.groqKey) openSettings(true); else if (!backFromGoogle) greet();
   window.Aura = { ask, gesture, say, openSettings, openHistory };   // handy for testing
 })();

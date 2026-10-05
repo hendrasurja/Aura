@@ -20,7 +20,7 @@
     <button id="btn-history" class="icon-btn" aria-label="Conversation">
       <svg viewBox="0 0 24 24"><path d="M4 5h16v10H8l-4 4z"/></svg>
     </button>
-    <div id="title">Aura</div>
+    <div id="title">Aura<small id="via"></small></div>
     <button id="btn-settings" class="icon-btn" aria-label="Settings">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></svg>
     </button>
@@ -66,13 +66,19 @@
     <label>Your name<input id="s-name" type="text" placeholder="So Mira knows what to call you"></label>
     <label>Gemini API key<input id="s-gemini" type="password" placeholder="From aistudio.google.com" autocapitalize="off" spellcheck="false"></label>
     <label>Groq API key<input id="s-groq" type="password" placeholder="From console.groq.com (voice)" autocapitalize="off" spellcheck="false"></label>
-    <label>Model<select id="s-model"></select></label>
+    <label>Main Gemini model<select id="s-model"></select></label>
     <label class="row">Speak replies<input id="s-speak" type="checkbox"></label>
     <label>Voice<select id="s-voice"></select></label>
     <label>Voice style<select id="s-style"></select></label>
     <label class="row">Little sounds<input id="s-sounds" type="checkbox"></label>
     <label>Personality<textarea id="s-persona" rows="6"></textarea></label>
     <p class="note">Tip: paste the text of your Mac's <code>~/.cloe/soul.md</code> here so Mira is the same person on both.</p>
+    <h3 class="sec">Brains</h3>
+    <p class="note">Mira tries these from top to bottom. When one runs out of free quota she uses the next, and goes back to the top one as soon as it has refreshed. Register as many free ones as you like.</p>
+    <div id="brains"></div>
+    <select id="brain-add" class="addsel"></select>
+    <label class="row">Share my calendar with backup brains<input id="s-sharecal" type="checkbox"></label>
+    <p class="note">Off by default: your calendar then goes to Gemini only. Everything else you say (and the things she remembers) goes to whichever brain answers, and free plans may keep prompts, so keep confidential deal details out of chats with backup brains.</p>
     <h3 class="sec">Connections</h3>
     <label class="row">WhatsApp drafts<input id="s-wa" type="checkbox"></label>
     <label>WhatsApp contacts (one per line)<textarea id="s-contacts" rows="3" placeholder="Budi: 0812 3456 7890&#10;Wife: 0811 222 333"></textarea></label>
