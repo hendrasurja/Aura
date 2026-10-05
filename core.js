@@ -345,7 +345,8 @@
     return t.length ? Math.min(...t) : 0;
   }
 
-  const api = { CATALOG, LITE, defaultPool, describe, available, quotaResetAt, classifyFailure, markFail, markOk, backText, statusOf, restingSummary, soonestReturn,
+  const BUILD = '11';
+  const api = { BUILD, CATALOG, LITE, defaultPool, describe, available, quotaResetAt, classifyFailure, markFail, markOk, backText, statusOf, restingSummary, soonestReturn,
     stripThink, openaiPayload, parseContacts, whatsappLink, localToRfc, formatEvents, quotaInfo, quotaResetText, GIF_MS, GESTURES, SOUND_LINES, STYLES, VOICES, MODELS, DEFAULT_PERSONA, buildSystemPrompt, parseSSE, eventPayload, splitTags, plain, splitForTts, friendlyError };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.AuraCore = api;
 })(typeof window !== 'undefined' ? window : globalThis);

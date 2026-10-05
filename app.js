@@ -3,7 +3,9 @@
 (function () {
   'use strict';
   const C = window.AuraCore;
-  const $ = (id) => document.getElementById(id);
+  const APP_BUILD = '11';
+  // A missing element (page and script from different versions) must never crash the whole app
+  const $ = (id) => document.getElementById(id) || document.createElement('div');
   const store = {
     get: (k, d) => { try { const v = localStorage.getItem('aura.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
     set: (k, v) => { try { localStorage.setItem('aura.' + k, JSON.stringify(v)); } catch {} },
@@ -620,7 +622,17 @@
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') greet(); });
 
   // ───────── start ─────────
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Pieces from different versions (page cached, script new, or the other way round): reload once to repair, and say so in Settings
+  const buildsMatch = C.BUILD === APP_BUILD && (document.querySelector('script[src^="app.js"]') || {}).src.includes(`v=${APP_BUILD}`);
+  $('ver').textContent = buildsMatch ? `version ${APP_BUILD}` : `version mismatch (${C.BUILD}/${APP_BUILD}), reloading`;
+  if (!buildsMatch && !sessionStorage.getItem('aura.repaired')) { sessionStorage.setItem('aura.repaired', '1'); location.replace(location.pathname + '?r=' + Date.now()); }
+  if ('serviceWorker' in navigator) {
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+    navigator.serviceWorker.addEventListener('controllerchange', () => {            // a new version took over: reload once to use it
+      if (hadController && !sessionStorage.getItem('aura.swreload') && !busy) { sessionStorage.setItem('aura.swreload', '1'); location.reload(); }
+    });
+  }
   imgs[0].addEventListener('load', placeBubble);
   const backFromGoogle = handleOAuthReturn() !== false;
   updateVia();
