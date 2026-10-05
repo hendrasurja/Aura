@@ -46,9 +46,14 @@
         'Briefly say in your reply that you drafted it; the user taps a button to open WhatsApp and send it themselves. ' +
         (contacts && contacts.length ? `Saved WhatsApp contacts: ${contacts.join(', ')}.` : 'No contacts are saved; use the name the user gives.'));
     }
-    if (calendar) {
-      parts.push(`Google Calendar (the user's, local time). Upcoming events, next 7 days:\n${calendar.events || '(none)'}\n` +
-        'Answer schedule questions from this list. ' +
+    if (calendar && calendar.off) {
+      parts.push('Google Calendar is NOT connected to you. If the user asks you to add an event or to look at their schedule, tell them honestly: ' +
+        'open Settings > Connections > Google Calendar and tap Connect (it needs the one-time Google setup), and meanwhile you can draft a WhatsApp message. ' +
+        'Never say you added or saved anything to a calendar, and never say you are "not integrated with Google Calendar": it is a feature that can be switched on.');
+    } else if (calendar) {
+      parts.push((calendar.events === null || calendar.events === undefined
+        ? 'Google Calendar (the user\'s, local time) is connected, but you cannot see their existing events right now' + (calendar.failed ? ' (reading it failed just now)' : ' (they are not shared with this assistant brain for privacy)') + '. If asked about their schedule, say you cannot see it at the moment; never guess it.\n'
+        : `Google Calendar (the user's, local time). Upcoming events, next 7 days:\n${calendar.events || '(none)'}\nAnswer schedule questions from this list.\n`) +
         (calendar.canAdd
           ? 'To add an event when asked, add [calendar_add: Title | YYYY-MM-DDTHH:MM | YYYY-MM-DDTHH:MM | Location] at the very end (start, end, local time; end = start + 1 hour if not given; location may be empty). The user confirms with a button before it is added; say you have prepared it.'
           : 'You can read the calendar but not add events: if asked to add one, say they can switch that on in Settings.'));

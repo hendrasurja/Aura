@@ -121,9 +121,16 @@
   // ───────── conversation with Gemini ─────────
   let busy = false;
   let calCtx = null;                                   // { events, canAdd } while the calendar is connected
+  /** What a brain is told about the calendar. Existing events go to backup brains only if allowed; the ability to add an event always goes. */
+  function calendarFor(type) {
+    if (!S.calendar || !S.gcid) return { off: true };
+    const canAdd = !!(S.calAdd && calToken());
+    if (calCtx && (type === 'gemini' || S.shareCalendar)) return { ...calCtx, canAdd };
+    return { events: null, canAdd, failed: !calCtx };
+  }
   const promptFor = (type, search) => C.buildSystemPrompt({ persona: S.persona, userName: S.name, memory, now: new Date().toString(),
     whatsapp: S.whatsapp, contacts: C.parseContacts(S.contacts).map((c) => c.name),
-    calendar: (type === 'gemini' || S.shareCalendar) ? calCtx : null, search });      // calendar goes to backup brains only if allowed
+    calendar: calendarFor(type), search });
   async function pump(res, map, onChunk) {
     const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
     for (;;) {
@@ -169,7 +176,10 @@
     if (!C.available(pool(), S, {}).length) { openSettings(); return; }
     if (S.calendar && S.gcid) {
       const ok = await refreshCalendar();
-      if (ok === 'renewing') { sessionStorage.setItem('aura.pending', text); return; }   // back after Google, then we ask
+      if (ok === 'renewing') { sessionStorage.setItem('aura.pending', JSON.stringify({ text, at: Date.now() })); return; }   // back after Google, then we ask
+      if (ok === false && calNotice && Date.now() - lastCalNotice > 10 * 60e3) {            // tell her person why the calendar isn't working
+        lastCalNotice = Date.now(); say(`<span class="err">${esc(calNotice)}</span>`, 14); await sleep(3500);
+      }
     } else calCtx = null;
     busy = true; $('btn-mic').disabled = true;
     history.push({ role: 'user', text }); store.set('history', history);
@@ -227,7 +237,11 @@
     if (!gestured && !speaking) show('blink');
     for (const m of t.memories) if (!memory.includes(m)) memory.push(m);
     memory = memory.slice(-60); store.set('memory', memory);
-    pendingActions = t.actions.filter((a) => (a.type === 'whatsapp' && S.whatsapp) || (a.type === 'calendar' && calCtx && calCtx.canAdd));
+    const calOk = !!(S.calendar && S.gcid && S.calAdd && calToken());
+    pendingActions = t.actions.filter((a) => (a.type === 'whatsapp' && S.whatsapp) || (a.type === 'calendar' && calOk));
+    if (t.actions.some((a) => a.type === 'calendar') && !calOk) {          // never leave her claiming something that cannot happen
+      t.visible += '\n\n(I couldn\'t prepare that calendar event: ' + (S.calendar ? 'adding events is switched off or your Google sign-in has expired. Check Settings > Connections.' : 'Google Calendar isn\'t connected. Settings > Connections > Connect Google Calendar.') + ')';
+    }
     actionsHtml = pendingActions.map(actionCard).join('');
     const notes = pendingActions.map((a) => a.type === 'whatsapp' ? `\n[WhatsApp draft to ${a.to}: ${a.text}]` : `\n[Calendar event prepared: ${a.title}, ${a.start}${a.end ? '–' + a.end : ''}]`).join('');
     history.push({ role: 'model', text: t.visible + notes, sources, via: used.label }); history = history.slice(-80); store.set('history', history);
@@ -431,6 +445,7 @@
       `<button class="btn" data-act="cal-add" data-i="${i}">Add to calendar</button><button class="btn ghost" data-act="cancel" data-i="${i}">No thanks</button></div>`;
   }
   async function runAction(kind, i) {
+    if (kind === 'cal-reconnect') { calConnect(false); return; }
     const a = pendingActions[i];
     if (kind === 'cancel' || !a) { hide(); return; }
     if (kind === 'cal-add') {
@@ -453,7 +468,15 @@
   // ───────── Google Calendar (sign-in straight from the phone, no server) ─────────
   const calScope = () => S.calAdd ? 'https://www.googleapis.com/auth/calendar.events' : 'https://www.googleapis.com/auth/calendar.readonly';
   const redirectUri = () => location.origin + location.pathname.replace(/index\.html$/, '');
-  let calCache = 0;
+  let calCache = 0, calNotice = '', lastCalNotice = 0;
+  function calErrorText(status, body) {
+    const b = String(body || ''); let msg = ''; try { const j = JSON.parse(b); msg = (j.error && j.error.message) || ''; } catch { /* not JSON */ }
+    if (status === 403 && /has not been used|disabled|accessNotConfigured|not enabled/i.test(b)) return 'The Google Calendar API is not switched on for your Google Cloud project. Open console.cloud.google.com > APIs & Services > Library > Google Calendar API > Enable.';
+    if (status === 403) return `Google refused calendar access${msg ? ' (' + msg + ')' : ''}. Tap Disconnect, then Connect again and allow calendar access.`;
+    if (status === 401) return 'Your Google sign-in expired. Tap Connect Google Calendar again.';
+    if (status === 0) return 'I couldn\'t reach Google just now.';
+    return `Google said ${status}${msg ? ': ' + msg : ''}.`;
+  }
   function calConnect(silent) {
     const state = Math.random().toString(36).slice(2);
     sessionStorage.setItem('aura.oauthState', state);
@@ -475,10 +498,10 @@
       const r = await calFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?' + new URLSearchParams({
         timeMin: now.toISOString(), timeMax: until.toISOString(), singleEvents: 'true', orderBy: 'startTime', maxResults: '30' }));
       if (r.status === 401) { store.set('calToken', null); calConnect(true); return 'renewing'; }
-      if (!r.ok) throw new Error(r.status);
-      calCtx = { events: C.formatEvents((await r.json()).items || []), canAdd: S.calAdd }; calCache = Date.now();
+      if (!r.ok) throw { status: r.status, body: await r.text().catch(() => '') };
+      calCtx = { events: C.formatEvents((await r.json()).items || []), canAdd: S.calAdd }; calCache = Date.now(); calNotice = '';
       return true;
-    } catch (e) { console.warn('calendar', e); calCtx = null; return false; }
+    } catch (e) { console.warn('calendar', e); calCtx = null; calNotice = calErrorText(e.status === undefined ? 0 : e.status, e.body); return false; }
   }
   function handleOAuthReturn() {
     if (!location.hash.includes('state=')) return false;
@@ -488,19 +511,20 @@
     if (h.get('access_token')) {
       store.set('calToken', { token: h.get('access_token'), exp: Date.now() + (Number(h.get('expires_in')) || 3600) * 1000 - 60e3, scope: calScope() });
       S.calendar = true; saveSettings();
-      const pending = sessionStorage.getItem('aura.pending'); sessionStorage.removeItem('aura.pending');
+      let pending = null; try { const p = JSON.parse(sessionStorage.getItem('aura.pending') || 'null'); if (p && Date.now() - p.at < 10 * 60e3) pending = p.text; } catch { /* old format */ }
+      sessionStorage.removeItem('aura.pending');
       if (pending) setTimeout(() => ask(pending), 600);
       else setTimeout(() => { gesture('celebrate'); say('Your Google Calendar is connected!', 5); }, 800);
     } else if (h.get('error')) {
-      sessionStorage.removeItem('aura.pending');
-      if (h.get('error') === 'access_denied') { S.calendar = false; saveSettings(); }
-      setTimeout(() => say(esc(h.get('error') === 'access_denied' ? 'Okay, I won\'t use your calendar.' : 'I need you to reconnect your calendar: Settings > Connect Google Calendar.'), 8), 800);
+      if (h.get('error') === 'access_denied') { sessionStorage.removeItem('aura.pending'); S.calendar = false; saveSettings(); }
+      setTimeout(() => say(h.get('error') === 'access_denied' ? esc('Okay, I won\'t use your calendar.') : `${esc('I need you to sign in to Google again (it asks about once an hour).')}<div class="act"><button class="btn" data-act="cal-reconnect" data-i="0">Sign in to Google</button></div>`, h.get('error') === 'access_denied' ? 8 : 60), 800);
     }
     return true;
   }
   function calStatus() {
     const el = $('cal-status'), on = S.calendar && S.gcid;
-    el.textContent = on ? (calToken() ? 'Connected' : 'Connected (signs in again when needed)') : 'Not connected';
+    const t = store.get('calToken', null);
+    el.textContent = on ? (calToken() ? `Connected (sign-in valid until ${new Date(t.exp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })})` : 'Connected (sign-in expired, renews when you ask)') : 'Not connected';
     el.classList.toggle('on', !!on);
     $('btn-cal').textContent = on ? 'Disconnect Google Calendar' : 'Connect Google Calendar';
   }
@@ -509,6 +533,24 @@
     if (S.calendar) { S.calendar = false; store.set('calToken', null); calCtx = null; saveSettings(); calStatus(); return; }
     if (!S.gcid) { alert('First paste your Google OAuth Client ID (see the setup guide).'); return; }
     calConnect(false);
+  });
+
+  $('btn-cal-test').addEventListener('click', async () => {
+    readSettings();
+    const out = $('cal-test-out'); out.className = 'test-out';
+    if (!S.gcid) { out.className = 'test-out bad'; out.textContent = 'Paste your Google Client ID first.'; return; }
+    if (!S.calendar) { out.className = 'test-out bad'; out.textContent = 'Not connected yet. Tap "Connect Google Calendar" above, allow access, and you come back here.'; return; }
+    if (!calToken()) { out.className = 'test-out bad'; out.textContent = 'Your Google sign-in has expired (it lasts one hour). Tap Disconnect, then Connect again, or just ask Mira something and she will renew it.'; return; }
+    out.textContent = 'Testing…';
+    try {
+      const now = new Date(), until = new Date(now.getTime() + 7 * 864e5);
+      const r = await calFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?' + new URLSearchParams({ timeMin: now.toISOString(), timeMax: until.toISOString(), singleEvents: 'true', maxResults: '50' }));
+      const body = await r.text();
+      if (!r.ok) { out.className = 'test-out bad'; out.textContent = calErrorText(r.status, body); return; }
+      const n = (JSON.parse(body).items || []).length;
+      out.className = 'test-out ok';
+      out.textContent = `Working: I can read your calendar (${n} event${n === 1 ? '' : 's'} in the next 7 days). Adding events is ${S.calAdd ? 'on (you confirm each one with a button)' : 'switched off'}.`;
+    } catch { out.className = 'test-out bad'; out.textContent = calErrorText(0, ''); }
   });
 
   // ───────── conversation sheet ─────────
