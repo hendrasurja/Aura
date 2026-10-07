@@ -268,7 +268,7 @@
     const c = CATALOG[entry.kind] || CATALOG.custom;
     const type = c.type;
     const key = c.shared ? (S[c.shared] || '') : type === 'gemini' ? (S.geminiKey || '') : (entry.key || '');
-    return { ...entry, type, label: entry.label || (entry.kind === 'gemini' ? (entry.model === LITE ? 'Gemini Flash-Lite' : 'Google Gemini') : c.label), base: String(entry.base || c.base || '').replace(/\/+$/, ''), model: entry.model || c.model || '', key: String(key).trim(), meta: c };
+    return { ...entry, limit: entry.limit !== undefined ? entry.limit : defaultLimit({ ...entry }), type, label: entry.label || (entry.kind === 'gemini' ? (entry.model === LITE ? 'Gemini Flash-Lite' : 'Google Gemini') : c.label), base: String(entry.base || c.base || '').replace(/\/+$/, ''), model: entry.model || c.model || '', key: String(key).trim(), meta: c };
   }
   /** Entries that can be tried right now, in the user's order. */
   function available(pool, S, health, now = Date.now()) {
@@ -345,7 +345,7 @@
     return t.length ? Math.min(...t) : 0;
   }
 
-  const BUILD = '13';
+  const BUILD = '14';
   // ───────── schedule questions answered straight from the calendar (no AI involved) ─────────
   const guessLang = (t) => (/\b(besok|lusa|hari ini|jadwal|kalender|agenda|saya|aku|gue|apa|ada|minggu|pekan|senin|selasa|rabu|kamis|jumat|sabtu|rapat|acara|kosong|sibuk|bisa)\b/i.test(t) ? 'id' : 'en');
   /** "what's on my calendar tomorrow", "am I free Friday afternoon", "apa jadwal saya besok"… (not adding events) */
@@ -487,7 +487,77 @@
     if (!en || isNaN(en) || en <= st) en = new Date(st.getTime() + 3600e3);
     return { ev: { type: 'calendar', title: String(j.title).trim().slice(0, 120), start: fmtLocal(st), end: fmtLocal(en), location: String(j.location || '').trim().slice(0, 120) } };
   }
-  const api = { BUILD, guessLang, scheduleIntent, isFreeQuestion, parseRange, rangeLabel, normalizeEvents, freeGaps, formatSchedule, calendarIntent, parseEventJson, CATALOG, LITE, defaultPool, describe, available, quotaResetAt, classifyFailure, markFail, markOk, backText, statusOf, restingSummary, soonestReturn,
+
+  // ───────── reminders that ring (a short calendar event with a pop-up alert) ─────────
+  function reminderIntent(text) {
+    return /\b(?:remind me|set (?:me )?(?:a |an )?reminders?|reminder (?:for|to|at|about)|(?:add|create|make) (?:a |an )?reminder|ingatkan(?:\s+(?:saya|aku|gue|ku))?|pengingat)\b/.test(String(text || '').toLowerCase());
+  }
+  const REPEAT_RRULE = { daily: 'RRULE:FREQ=DAILY', weekdays: 'RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR', weekly: 'RRULE:FREQ=WEEKLY', monthly: 'RRULE:FREQ=MONTHLY' };
+  const REPEAT_TEXT = { en: { daily: 'every day', weekdays: 'every weekday', weekly: 'every week', monthly: 'every month' }, id: { daily: 'setiap hari', weekdays: 'setiap hari kerja', weekly: 'setiap minggu', monthly: 'setiap bulan' } };
+  /** The model's JSON for a reminder: { ev:{type:'reminder',title,start,end,repeat} } | { missing:true } | null */
+  function parseReminderJson(out) {
+    const m = String(out || '').replace(/```(?:json)?/gi, '').match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    let j; try { j = JSON.parse(m[0]); } catch { return null; }
+    if (j.error) return { missing: true };
+    const ok = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(String(j.start || ''));
+    if (!j.title || !ok) return j.title || j.start ? { missing: true } : null;
+    const st = new Date(String(j.start).slice(0, 16)); if (isNaN(st)) return null;
+    const rep = REPEAT_RRULE[String(j.repeat || '').toLowerCase()] ? String(j.repeat).toLowerCase() : 'none';
+    return { ev: { type: 'reminder', title: String(j.title).trim().slice(0, 120), start: fmtLocal(st), end: fmtLocal(new Date(st.getTime() + 15 * 60e3)), repeat: rep } };
+  }
+
+  // ───────── the daily brief ─────────
+  const briefIntent = (text) => /\b(?:brief me|morning brief|daily brief|my brief|(?:give|show|read) me (?:my |the )?(?:brief|briefing)|briefing|ringkasan(?: hari ini| pagi)?|rangkuman hari ini)\b/.test(String(text || '').toLowerCase());
+  const WX = {
+    en: [[0, 'clear skies'], [1, 'mostly clear'], [2, 'partly cloudy'], [3, 'overcast'], [45, 'foggy'], [48, 'foggy'], [51, 'light drizzle'], [53, 'drizzle'], [55, 'heavy drizzle'], [61, 'light rain'], [63, 'rain'], [65, 'heavy rain'], [71, 'light snow'], [73, 'snow'], [75, 'heavy snow'], [80, 'rain showers'], [81, 'rain showers'], [82, 'heavy showers'], [95, 'thunderstorms'], [96, 'thunderstorms with hail'], [99, 'thunderstorms with hail']],
+    id: [[0, 'cerah'], [1, 'cerah berawan'], [2, 'berawan sebagian'], [3, 'mendung'], [45, 'berkabut'], [48, 'berkabut'], [51, 'gerimis ringan'], [53, 'gerimis'], [55, 'gerimis lebat'], [61, 'hujan ringan'], [63, 'hujan'], [65, 'hujan lebat'], [71, 'salju ringan'], [73, 'salju'], [75, 'salju lebat'], [80, 'hujan lokal'], [81, 'hujan lokal'], [82, 'hujan deras'], [95, 'badai petir'], [96, 'badai petir dan es'], [99, 'badai petir dan es']],
+  };
+  function weatherWord(code, lang = 'en') { const t = WX[lang] || WX.en; let w = t[0][1]; for (const [c, x] of t) if (code >= c) w = x; return w; }
+  const greetingFor = (h, lang) => (lang === 'id' ? (h < 11 ? 'Selamat pagi' : h < 15 ? 'Selamat siang' : h < 18 ? 'Selamat sore' : 'Selamat malam') : (h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening'));
+  /** Brief text from whatever parts could be fetched: cal {items} | weather {city,temp,min,max,rain,code} | btc {usd,chg} | spx 'S&P 500 6,123 (+0.4%)' */
+  function formatBrief({ name, lang = 'en', now = new Date(), cal, weather, btc, spx }) {
+    const hi = `${greetingFor(now.getHours(), lang)}${name ? ', ' + name : ''}`;
+    const id = lang === 'id'; const parts = []; const spoken = [];
+    if (cal) {
+      const out = formatSchedule(cal.items || [], parseRange('today', now), { lang });
+      const [sentence, list] = out.text.split('\n\n');
+      parts.push(`${id ? 'Kalender' : 'Calendar'}\n${sentence}${list ? '\n' + list : ''}`); spoken.push(out.speak);
+    }
+    if (weather) {
+      const w = weatherWord(weather.code, lang);
+      parts.push(`${id ? 'Cuaca di' : 'Weather in'} ${weather.city}\n${id ? `${weather.temp}°C sekarang, ${weather.min}–${weather.max}°C hari ini, ${w}, peluang hujan ${weather.rain}%.` : `${weather.temp}°C now, ${weather.min}–${weather.max}°C today, ${w}, ${weather.rain}% chance of rain.`}`);
+      spoken.push(id ? `Di ${weather.city} ${weather.temp} derajat, ${w}.` : `It's ${weather.temp} degrees in ${weather.city}, ${w}.`);
+    }
+    const mk = [];
+    if (btc) mk.push(`Bitcoin $${Math.round(btc.usd).toLocaleString('en-US')} (${btc.chg >= 0 ? '+' : ''}${btc.chg.toFixed(1)}% ${id ? 'dalam 24 jam' : 'in 24h'})`);
+    if (spx) mk.push(spx);
+    if (mk.length) parts.push(`${id ? 'Pasar' : 'Markets'}\n${mk.join('\n')}`);
+    const head = id ? `${hi}! Ini hari kamu.` : `${hi}! Here's your day.`;
+    if (!parts.length) { const t = id ? `${hi}! Aku belum bisa mengambil kalender, cuaca atau pasar sekarang.` : `${hi}! I couldn't fetch your calendar, weather or markets just now.`; return { text: t, speak: t }; }
+    return { text: `${head}\n\n${parts.join('\n\n')}`, speak: `${head} ${spoken.join(' ')}`.trim() };
+  }
+
+  // ───────── how much each brain has been used today ─────────
+  const usageOf = (u, id, day) => (u && u.day === day && u.n && u.n[id]) || { ok: 0, fail: 0 };
+  function usageBump(u, id, kind, day) {
+    const base = u && u.day === day ? u : { day, n: {}, warned: {} };
+    const e = { ok: 0, fail: 0, ...(base.n[id] || {}) }; e[kind === 'ok' ? 'ok' : 'fail']++;
+    return { day, n: { ...base.n, [id]: e }, warned: base.warned || {} };
+  }
+  const usageTotal = (u, day) => (u && u.day === day ? Object.values(u.n).reduce((a, e) => ({ ok: a.ok + e.ok, fail: a.fail + e.fail }), { ok: 0, fail: 0 }) : { ok: 0, fail: 0 });
+  /** A rough free-tier size per day for the common cases (editable in Settings). */
+  function defaultLimit(entry) {
+    if (entry.kind === 'openrouter') return 50;
+    if (entry.kind === 'cerebras') return 100;
+    if (entry.kind === 'gemini') return /lite/i.test(entry.model || '') ? null : 20;
+    return null;
+  }
+  function usageWarning(label, used, limit) {
+    return `Heads up: ${label} is at ${used} of about ${limit} free requests today. When it runs out she'll switch to the next brain by herself.`;
+  }
+
+  const api = { reminderIntent, REPEAT_RRULE, REPEAT_TEXT, parseReminderJson, briefIntent, weatherWord, greetingFor, formatBrief, usageOf, usageBump, usageTotal, defaultLimit, usageWarning, BUILD, guessLang, scheduleIntent, isFreeQuestion, parseRange, rangeLabel, normalizeEvents, freeGaps, formatSchedule, calendarIntent, parseEventJson, CATALOG, LITE, defaultPool, describe, available, quotaResetAt, classifyFailure, markFail, markOk, backText, statusOf, restingSummary, soonestReturn,
     stripThink, openaiPayload, parseContacts, whatsappLink, localToRfc, formatEvents, quotaInfo, quotaResetText, GIF_MS, GESTURES, SOUND_LINES, STYLES, VOICES, MODELS, DEFAULT_PERSONA, buildSystemPrompt, parseSSE, eventPayload, splitTags, plain, splitForTts, friendlyError };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.AuraCore = api;
 })(typeof window !== 'undefined' ? window : globalThis);

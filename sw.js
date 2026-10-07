@@ -1,6 +1,6 @@
 /* Aura offline cache: the app and Mira's GIFs load instantly after the first visit.
    Gemini and Groq calls always go to the network. Bump VERSION when files change. */
-const VERSION = 'aura-v13';
+const VERSION = 'aura-v14';
 const SHELL = ['./', 'index.html', 'style.css', 'core.js', 'app.js', 'manifest.webmanifest',
   'icons/icon-180.png', 'icons/icon-192.png', 'gifs/blink.gif', 'gifs/think.gif', 'gifs/speak.gif'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())); });

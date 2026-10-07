@@ -3,7 +3,7 @@
 (function () {
   'use strict';
   const C = window.AuraCore;
-  const APP_BUILD = '13';
+  const APP_BUILD = '14';
   // A missing element (page and script from different versions) must never crash the whole app
   const $ = (id) => document.getElementById(id) || document.createElement('div');
   const store = {
@@ -13,7 +13,7 @@
 
   // ───────── settings ─────────
   const DEFAULTS = { name: '', geminiKey: '', groqKey: '', model: C.MODELS[0], speak: true, voice: 'hannah', style: 'soft-cheerful', sounds: true, persona: C.DEFAULT_PERSONA,
-    whatsapp: true, contacts: '', gcid: '', calendar: false, calAdd: true, pool: null, shareCalendar: false };
+    whatsapp: true, contacts: '', gcid: '', calendar: false, calAdd: true, pool: null, shareCalendar: false, brief: true, briefCity: 'Jakarta', briefLang: 'en', briefMarkets: true };
   let S = { ...DEFAULTS, ...store.get('settings', {}) };
   const saveSettings = () => store.set('settings', S);
   let history = store.get('history', []);           // [{ role: 'user'|'model', text, sources? }]
@@ -22,6 +22,9 @@
   const pool = () => { if (!Array.isArray(S.pool)) { S.pool = C.defaultPool(S.model); saveSettings(); } return S.pool; };
   let health = store.get('health', {});
   const setHealth = (h) => { health = h; store.set('health', h); };
+  let usage = store.get('usage', null);                          // requests per brain today, on this phone
+  const todayKey = () => new Date().toDateString();
+  const bumpUse = (id, kind) => { usage = C.usageBump(usage, id, kind, todayKey()); store.set('usage', usage); };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ───────── audio (iOS needs a tap before any sound) ─────────
@@ -187,6 +190,22 @@
     history.push({ role: 'user', text }); store.set('history', history);
     dots(); if (!speaking) { clearTimeout(gestureTimer); show('think'); }
     actionsHtml = ''; pendingActions = [];
+    if (C.briefIntent(text)) { const out = await buildBrief(); await cannedReply({ visible: out.text, gestureName: 'wave', speakText: out.speak }); return; }
+    if (C.reminderIntent(text)) {                                                          // "remind me at 3pm to call Budi"
+      if (S.calendar && S.gcid && S.calAdd && calToken()) {
+        const r = await extractReminder(text);
+        if (r && !r.down) {
+          if (r.ev) {
+            const when = new Date(r.ev.start).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+            const rep = r.ev.repeat !== 'none' ? `, ${C.REPEAT_TEXT.en[r.ev.repeat]}` : '';
+            await cannedReply({ visible: `Okay, I prepared a reminder: “${r.ev.title}” on ${when}${rep}. Tap Set reminder to confirm.`, acts: [r.ev], gestureName: 'nod' }); return;
+          }
+          await cannedReply({ visible: r.missing ? 'Sure! When should I remind you? Give me a day and time.' : 'I couldn\'t work out the time. Try: “Remind me tomorrow at 9 to call Budi”.', gestureName: 'think' }); return;
+        }
+      } else {
+        await cannedReply({ visible: S.calendar ? 'To set reminders I need permission to add events: switch on “Let Mira add events” in Settings > Connections, then connect again.' : 'Reminders ring through your Google Calendar. Connect it in Settings > Connections, then ask me again.', gestureName: 'think' }); return;
+      }
+    }
     if (S.calendar && S.gcid && S.calAdd && calToken() && C.calendarIntent(text)) {      // "add lunch tomorrow 11 to 1:30": do it ourselves
       const r = await extractEvent(text);
       if (r && !r.down) {                                    // (if every brain is down, carry on so she can say so)
@@ -244,9 +263,10 @@
         updateVia(); failAndReturn(); return;
       }
       for (const entry of order) {
-        try { await attempt(entry); used = entry; break attempts; }
+        try { await attempt(entry); bumpUse(entry.id, 'ok'); used = entry; break attempts; }
         catch (err) {
-          if (raw) { used = entry; break attempts; }                      // partial answer: keep what we have
+          if (raw) { bumpUse(entry.id, 'ok'); used = entry; break attempts; }
+          bumpUse(entry.id, 'fail');                      // partial answer: keep what we have
           const cls = C.classifyFailure({ status: err.status, body: err.body, type: entry.type, fails: (health[entry.id] || {}).fails || 0 });
           console.warn('brain failed', entry.label, err.status, cls);
           setHealth(C.markFail(health, entry.id, cls)); updateVia();
@@ -271,6 +291,8 @@
     if (!t.visible && !pendingActions.length) { hide(); return; }
     const spoke = S.speak && t.visible && (await speak(t.visible));
     if (pendingActions.length) hideIn(45); else if (!spoke) hideIn(readTime(t.visible)); else hideIn(2.5);
+    const wmsg = usageWarn(used);                                  // a quiet heads-up as a free limit gets close
+    if (wmsg) setTimeout(() => { if (!busy && !pendingActions.length) say(esc(wmsg), 10); }, ((pendingActions.length ? 0 : spoke ? 3.5 : readTime(t.visible)) + 1) * 1000);
   }
 
   // ───────── her voice (Groq Orpheus) ─────────
@@ -423,6 +445,7 @@
   function renderBrains() {
     const box = $('brains'); if (!box) return; box.innerHTML = '';
     const list = pool(), now = Date.now();
+    const tot = C.usageTotal(usage, todayKey()); $('usage-sum').textContent = `Today on this phone: ${tot.ok} answered${tot.fail ? `, ${tot.fail} limited or failed` : ''}. (Your Mac keeps its own count.)`;
     list.forEach((raw, i) => {
       const e = C.describe(raw, S), st = C.statusOf(raw, S, health, now), m = e.meta;
       const out = el('div', { class: 'test-out' });
@@ -431,6 +454,9 @@
         el('div', { class: 'brain-head' }, [el('b', { text: e.label }), chip]),
         el('div', { class: 'brain-note', text: m.shared ? m.note : e.type === 'gemini' ? 'Uses your Gemini key above. Separate free quota per model.' : m.note }),
       ]);
+      { const u = C.usageOf(usage, raw.id, todayKey()), n = u.ok + u.fail, lim = e.limit, hot = lim && n >= lim * 0.8;
+        card.appendChild(el('div', { class: `usage${hot ? ' hot' : ''}`, text: `Today: ${u.ok} answered${u.fail ? `, ${u.fail} limited or failed` : ''}${lim ? ` · about ${lim} free per day` : ''}` }));
+        card.appendChild(el('input', { type: 'number', min: '1', placeholder: lim ? `Daily limit (about ${lim})` : 'Daily limit (optional)', value: raw.limit ? String(raw.limit) : '', oninput: (ev) => { const v = parseInt(ev.target.value, 10); raw.limit = v > 0 ? v : undefined; saveSettings(); } })); }
       if (e.type === 'openai' && !m.shared) card.appendChild(el('input', { type: 'password', placeholder: 'API key', value: raw.key || '', autocapitalize: 'off', spellcheck: 'false', oninput: (ev) => { raw.key = ev.target.value.trim(); saveSettings(); } }));
       if (raw.kind === 'custom') card.appendChild(el('input', { type: 'text', placeholder: 'Address, e.g. https://api.example.com/v1', value: raw.base || '', autocapitalize: 'off', oninput: (ev) => { raw.base = ev.target.value.trim(); saveSettings(); } }));
       card.appendChild(el('input', { type: 'text', placeholder: 'Model', value: raw.model || e.model, autocapitalize: 'off', spellcheck: 'false', oninput: (ev) => { raw.model = ev.target.value.trim(); if (raw.id === 'gemini') { S.model = raw.model; } saveSettings(); } }));
@@ -482,12 +508,12 @@
   }
 
   // ───────── adding calendar events without relying on the AI to follow instructions ─────────
-  async function oneShot(entry, system, user) {
+  async function oneShot(entry, system, user, opts = {}) {
     if (entry.type === 'gemini') {
       let r;
       try { r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(entry.model)}:generateContent`, { method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': entry.key },
-        body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0, maxOutputTokens: 800 } }) }); }
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0, maxOutputTokens: 800 }, ...(opts.search ? { tools: [{ google_search: {} }] } : {}) }) }); }
       catch { throw { status: 0 }; }
       if (!r.ok) throw { status: r.status, body: await r.text().catch(() => '') };
       const j = await r.json(); return ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
@@ -500,32 +526,98 @@
     if (!r.ok) throw { status: r.status, body: await r.text().catch(() => '') };
     const j = await r.json(); return C.stripThink((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '');
   }
-  /** Ask any available brain to turn the sentence into event fields. Returns { ev } | { missing } | null. */
-  async function extractEvent(text) {
+  const nowText = () => {
     const d = new Date(), off = -d.getTimezoneOffset(), z = `UTC${off >= 0 ? '+' : '-'}${Math.floor(Math.abs(off) / 60)}`;
-    const nowTxt = `${d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}, ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} (${z})`;
-    const system = `Turn the user's message into one calendar event. Now it is ${nowTxt}; resolve "today", "tomorrow", weekdays and similar from that date. ` +
-      'Answer with ONLY a JSON object, nothing else: {"title":"short title","start":"YYYY-MM-DDTHH:MM","end":"YYYY-MM-DDTHH:MM","location":"place or empty"} in local time, 24-hour. ' +
-      'If no end time is given use start plus 1 hour. If the day or the time is missing, answer {"error":"missing"}.';
+    return `${d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}, ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} (${z})`;
+  };
+  /** Ask up to two available brains to fill in fields from a sentence. Returns the parser's result, { unusable } or { down }. */
+  async function extractWith(system, text, parse) {
     let tried = 0, got = false;
     for (const entry of C.available(pool(), S, health)) {
       if (tried >= 2) break;
       try {
         const out = await oneShot(entry, system, text); tried++; got = true;
-        setHealth(C.markOk(health, entry.id));
-        const r = C.parseEventJson(out); if (r) return r;
+        setHealth(C.markOk(health, entry.id)); bumpUse(entry.id, 'ok');
+        const r = parse(out); if (r) return r;
       } catch (err) {
         if (err.status === undefined) { tried++; continue; }              // an odd reply, not a failing brain: don't punish it
+        bumpUse(entry.id, 'fail');
         const cls = C.classifyFailure({ status: err.status, body: err.body, type: entry.type, fails: (health[entry.id] || {}).fails || 0 });
         setHealth(C.markFail(health, entry.id, cls)); updateVia();
       }
     }
-    return got ? { unusable: true } : { down: true };      // an answer we couldn't use, or no brain answered at all
+    return got ? { unusable: true } : { down: true };
+  }
+  const extractEvent = (text) => extractWith(
+    `Turn the user's message into one calendar event. Now it is ${nowText()}; resolve "today", "tomorrow", weekdays and similar from that date. ` +
+    'Answer with ONLY a JSON object, nothing else: {"title":"short title","start":"YYYY-MM-DDTHH:MM","end":"YYYY-MM-DDTHH:MM","location":"place or empty"} in local time, 24-hour. ' +
+    'If no end time is given use start plus 1 hour. If the day or the time is missing, answer {"error":"missing"}.', text, C.parseEventJson);
+  const extractReminder = (text) => extractWith(
+    `Turn the user's message into one reminder. Now it is ${nowText()}; resolve "today", "tomorrow", weekdays and similar from that date. ` +
+    'Answer with ONLY a JSON object, nothing else: {"title":"short action such as Call Budi","start":"YYYY-MM-DDTHH:MM","repeat":"none"} in local time, 24-hour. ' +
+    'repeat is one of none, daily, weekdays, weekly, monthly ("every day" = daily, "every weekday" = weekdays). If only a time is given with no day, use today if that time is still ahead, otherwise tomorrow. If no time can be worked out, answer {"error":"missing"}.', text, C.parseReminderJson);
+
+  // ───────── the daily brief ─────────
+  async function fetchJson(url, ms = 7000) {
+    const ac = new AbortController(), tm = setTimeout(() => ac.abort(), ms);
+    try { const r = await fetch(url, { signal: ac.signal }); if (!r.ok) throw new Error(String(r.status)); return await r.json(); } finally { clearTimeout(tm); }
+  }
+  async function getWeather(city) {
+    const gk = 'geo:' + city.toLowerCase(); let g = store.get(gk, null);
+    if (!g) {
+      const j = await fetchJson(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en`);
+      const r = j.results && j.results[0]; if (!r) throw new Error('city not found');
+      g = { lat: r.latitude, lon: r.longitude, name: r.name }; store.set(gk, g);
+    }
+    const j = await fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${g.lat}&longitude=${g.lon}&current=temperature_2m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code&timezone=auto&forecast_days=1`);
+    return { city: g.name, temp: Math.round(j.current.temperature_2m), min: Math.round(j.daily.temperature_2m_min[0]), max: Math.round(j.daily.temperature_2m_max[0]), rain: j.daily.precipitation_probability_max[0] || 0, code: j.daily.weather_code[0] };
+  }
+  async function getBitcoin() {
+    const j = await fetchJson('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true');
+    return { usd: j.bitcoin.usd, chg: j.bitcoin.usd_24h_change };
+  }
+  /** The S&P 500 has no free browser-friendly feed, so ask Gemini with Google Search (one request a day), and say nothing if it isn't sure. */
+  async function getSpx() {
+    const e = C.available(pool(), S, health).find((x) => x.type === 'gemini'); if (!e) return null;
+    try {
+      const out = await oneShot(e, 'Use Google Search to find the S&P 500 index most recent closing level and its percentage change for the last trading day. Answer with ONLY one line in exactly this format: S&P 500 6,123 (+0.4%). If you cannot find it, answer exactly UNAVAILABLE.', 'S&P 500 latest close', { search: true });
+      bumpUse(e.id, 'ok'); const m = out.match(/S&P 500\s+[\d,]+(?:\.\d+)?\s*\([+\-−]?\d+(?:\.\d+)?%\)/); return m ? m[0].replace('−', '-') : null;
+    } catch { bumpUse(e.id, 'fail'); return null; }
+  }
+  async function buildBrief() {
+    const now = new Date(), r0 = C.parseRange('today', now);
+    const calP = (S.calendar && S.gcid && calToken()) ? (async () => {
+      const r = await calFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?' + new URLSearchParams({ timeMin: r0.start.toISOString(), timeMax: r0.end.toISOString(), singleEvents: 'true', orderBy: 'startTime', maxResults: '50' }));
+      if (!r.ok) throw new Error(String(r.status)); return { items: (await r.json()).items || [] };
+    })() : Promise.reject(new Error('no calendar'));
+    const [c, w, b, sp] = await Promise.allSettled([calP, S.briefCity ? getWeather(S.briefCity) : Promise.reject(new Error('no city')), S.briefMarkets ? getBitcoin() : Promise.reject(new Error('off')), S.briefMarkets ? getSpx() : Promise.reject(new Error('off'))]);
+    return C.formatBrief({ name: S.name, lang: S.briefLang, now, cal: c.value || null, weather: w.value || null, btc: b.value || null, spx: sp.value || null });
+  }
+  /** The brief on the first open of the day (or when asked from Settings). */
+  async function autoBrief(force) {
+    if (busy || (!force && !S.brief)) return;
+    store.set('briefDay', todayKey()); busy = true; $('btn-mic').disabled = true; dots(); if (!speaking) show('think');
+    try { const out = await buildBrief(); await cannedReply({ visible: out.text, gestureName: 'wave', speakText: out.speak }); }
+    catch (e) { console.warn('brief', e); busy = false; $('btn-mic').disabled = false; hide(); if (!speaking) show('blink'); }
+  }
+  /** One heads-up per brain per day when it reaches 80% of its free requests. */
+  function usageWarn(entry) {
+    if (!entry) return null; const e = C.describe(entry, S), lim = e.limit; if (!lim) return null;
+    const u = C.usageOf(usage, entry.id, todayKey()), n = u.ok + u.fail;
+    if (n < Math.ceil(lim * 0.8) || n >= lim + 5) return null;
+    if (usage.warned && usage.warned[entry.id]) return null;
+    usage = { ...usage, warned: { ...(usage.warned || {}), [entry.id]: true } }; store.set('usage', usage);
+    return C.usageWarning(e.label, n, lim);
   }
 
   // ───────── WhatsApp drafts and calendar events ─────────
   let pendingActions = [];
   function actionCard(a, i) {
+    if (a.type === 'reminder') {
+      const st = new Date(a.start), when = isNaN(st) ? a.start : st.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+      return `<div class="act"><span class="draft">Reminder: ${esc(a.title)} · ${esc(when)}${a.repeat && a.repeat !== 'none' ? ' · ' + esc(C.REPEAT_TEXT.en[a.repeat]) : ''}</span>` +
+        `<button class="btn" data-act="rem-add" data-i="${i}">Set reminder</button><button class="btn ghost" data-act="cancel" data-i="${i}">No thanks</button></div>`;
+    }
     if (a.type === 'whatsapp') {
       const l = C.whatsappLink(a.to, a.text, C.parseContacts(S.contacts));
       return `<div class="act"><span class="draft">“${esc(a.text)}”</span><a class="btn" href="${l.url}" target="_blank" rel="noopener">${l.direct ? `Send to ${esc(l.name)} on WhatsApp` : 'Open WhatsApp'}</a></div>`;
@@ -539,6 +631,25 @@
     if (kind === 'cal-reconnect') { calConnect(false); return; }
     const a = pendingActions[i];
     if (kind === 'cancel' || !a) { hide(); return; }
+    if (kind === 'rem-add') {
+      const start = C.localToRfc(a.start), end = C.localToRfc(a.end);
+      if (!start || !end) { say('<span class="err">I couldn\'t read that time. Try asking again with a day and time.</span>', 7); return; }
+      say('<span class="dots"><span></span><span></span><span></span></span>');
+      const tz = (Intl.DateTimeFormat().resolvedOptions() || {}).timeZone;
+      const rule = C.REPEAT_RRULE[a.repeat];
+      try {
+        const r = await calFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ summary: a.title, start: { dateTime: start, ...(rule && tz ? { timeZone: tz } : {}) }, end: { dateTime: end, ...(rule && tz ? { timeZone: tz } : {}) },
+            reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 0 }] }, ...(rule ? { recurrence: [rule] } : {}) }),
+        });
+        if (!r.ok) throw new Error(String(r.status));
+        calCache = 0; gesture('nod');
+        const first = !store.get('remNoteShown', false); store.set('remNoteShown', true);
+        say(esc(`Reminder set: “${a.title}” at ${new Date(a.start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}${a.repeat && a.repeat !== 'none' ? ', ' + C.REPEAT_TEXT.en[a.repeat] : ''}. ${first ? 'Your Google Calendar will notify you, so check that notifications are on for it in iPhone Settings.' : 'Your calendar will notify you.'}`), first ? 12 : 6);
+      } catch (e) { say(`<span class="err">I couldn't set it (${esc(e.message)}). Try reconnecting the calendar in Settings.</span>`, 8); }
+      return;
+    }
     if (kind === 'cal-add') {
       const start = C.localToRfc(a.start);
       let end = C.localToRfc(a.end);
@@ -678,7 +789,7 @@
     $('s-name').value = S.name; $('s-gemini').value = S.geminiKey; $('s-groq').value = S.groqKey;
     $('s-model').value = S.model; $('s-speak').checked = S.speak; $('s-voice').value = S.voice; $('s-style').value = S.style;
     $('s-sounds').checked = S.sounds; $('s-persona').value = S.persona;
-    $('s-sharecal').checked = S.shareCalendar; renderBrains();
+    $('s-sharecal').checked = S.shareCalendar; $('s-brief').checked = S.brief; $('s-city').value = S.briefCity; $('s-blang').value = S.briefLang; $('s-bmark').checked = S.briefMarkets; renderBrains();
     $('s-wa').checked = S.whatsapp; $('s-contacts').value = S.contacts; $('s-gcid').value = S.gcid; $('s-caladd').checked = S.calAdd; calStatus();
     renderMemory(); $('settings').hidden = false;
   }
@@ -687,12 +798,13 @@
     S = { ...S, name: $('s-name').value.trim(), geminiKey: $('s-gemini').value.trim(), groqKey: $('s-groq').value.trim(), model: $('s-model').value,
       speak: $('s-speak').checked, voice: $('s-voice').value, style: $('s-style').value, sounds: $('s-sounds').checked,
       persona: $('s-persona').value.trim() || C.DEFAULT_PERSONA,
-      shareCalendar: $('s-sharecal').checked, whatsapp: $('s-wa').checked, contacts: $('s-contacts').value.trim(), gcid: $('s-gcid').value.trim(), calAdd: $('s-caladd').checked };
+      shareCalendar: $('s-sharecal').checked, brief: $('s-brief').checked, briefCity: $('s-city').value.trim(), briefLang: $('s-blang').value, briefMarkets: $('s-bmark').checked, whatsapp: $('s-wa').checked, contacts: $('s-contacts').value.trim(), gcid: $('s-gcid').value.trim(), calAdd: $('s-caladd').checked };
     { const g = (S.pool || []).find((e) => e.id === 'gemini'); if (g) g.model = S.model; }
     saveSettings(); updateVia();
     if (oldVoice !== S.voice) lastSound = 0;
   }
   $('btn-settings').addEventListener('click', () => openSettings(false));
+  $('btn-brief-now').addEventListener('click', () => { readSettings(); $('settings').hidden = true; autoBrief(true); });
   $('btn-test-voice').addEventListener('click', async () => {
     readSettings(); unlockAudio(); $('settings').hidden = true;
     say(esc(`Hi${S.name ? ' ' + S.name : ''}! This is my voice.`)); await speak(`Hi${S.name ? ' ' + S.name : ''}! This is my voice.`); hideIn(2);
@@ -703,6 +815,7 @@
     const now = new Date(), h = now.getHours(), today = now.toDateString();
     const lastSeen = store.get('lastSeen', 0); store.set('lastSeen', Date.now());
     if (!S.geminiKey) return;
+    if (S.brief && store.get('briefDay', '') !== today && h >= 4 && !busy && !sessionStorage.getItem('aura.pending')) { setTimeout(() => autoBrief(false), 1200); return; }
     const hi = S.name ? `, ${S.name}` : '';
     if (h >= 5 && h < 11 && store.get('morning', '') !== today) { store.set('morning', today); setTimeout(() => { gesture('drink'); say(esc(`Good morning${hi}! Coffee first?`), 6); }, 900); }
     else if (h >= 23 || h < 4) { setTimeout(() => { gesture('yawn'); say(esc('It\'s late… don\'t stay up too long.'), 6); }, 900); }
